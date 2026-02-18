@@ -12,7 +12,8 @@ langchain-core>=0.2.0
 python-dotenv
 
 streamlit
+langchain>=0.2.0
+langchain-community
 langchain-groq
 langchain-pinecone
-langchain-community
 pypdf
