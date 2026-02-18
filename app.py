@@ -4,9 +4,10 @@ from langchain_groq import ChatGroq
 from langchain_pinecone import PineconeVectorStore, PineconeEmbeddings
 from langchain.chains import RetrievalQA
 
-# 1. Setup API Keys (We'll use Streamlit Secrets later for security)
-os.environ["GROQ_API_KEY"] = "YOUR_GROQ_API_KEY"
-os.environ["PINECONE_API_KEY"] = "YOUR_PINECONE_API_KEY"
+# DO NOT put your actual keys here anymore!
+# Streamlit will look for these in its "Advanced Settings" later.
+os.environ["GROQ_API_KEY"] = st.secrets["GROQ_API_KEY"]
+os.environ["PINECONE_API_KEY"] = st.secrets["PINECONE_API_KEY"]
 
 # 2. Page Config
 st.set_page_config(page_title="LuxAgent Photonics", page_icon="💡")
