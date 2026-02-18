@@ -1,0 +1,7 @@
+data/
+.venv/
+.env
+__pycache__/
+*.pdf
+# Only include the vector_db if it's small (<100MB)
+# Otherwise, use Git LFS or host the DB elsewhere
