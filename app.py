@@ -2,7 +2,7 @@ import streamlit as st
 import os
 from langchain_groq import ChatGroq
 from langchain_pinecone import PineconeVectorStore, PineconeEmbeddings
-from langchain_community.chains import RetrievalQA
+# from langchain_community.chains import RetrievalQA
 
 # DO NOT put your actual keys here anymore!
 # Streamlit will look for these in its "Advanced Settings" later.
@@ -22,17 +22,18 @@ embeddings = PineconeEmbeddings(model="llama-text-embed-v2")
 vectorstore = PineconeVectorStore(index_name="lux-kb", embedding=embeddings)
 
 # 5. Create the "QA Chain"
-qa = RetrievalQA.from_chain_type(
-    llm=llm,
-    chain_type="stuff",
-    retriever=vectorstore.as_retriever(search_kwargs={"k": 3})
-)
+# qa = RetrievalQA.from_chain_type(
+#     llm=llm,
+#     chain_type="stuff",
+#     retriever=vectorstore.as_retriever(search_kwargs={"k": 3})
+# )
 
 # 6. The UI
 user_query = st.text_input("Ask a technical question about your papers:")
 
 if user_query:
     with st.spinner("Analyzing papers..."):
-        response = qa.invoke(user_query)
-        st.write("### Answer:")
-        st.write(response["result"])
+        print("so far so good")
+        # response = qa.invoke(user_query)
+        # st.write("### Answer:")
+        # st.write(response["result"])
