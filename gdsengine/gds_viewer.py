@@ -52,38 +52,36 @@ def _parse_lyp(lyp_bytes):
     return layer_colors
 
 
-def _build_canvas_data(top_cells, layer_colors=None):
-    """Collect polygon data as compact JSON for the Canvas renderer.
+def _build_cell_data(cell, layer_colors=None):
+    """Build canvas render data for a single gdstk Cell (polygons flattened).
 
-    Returns (layers_json_str, vb_x, vb_y, vb_w, vb_h) or
-            (None, ...) when no geometry is found.
+    Returns (layers_list, vb_x, vb_y, vb_w, vb_h) or (None, 0,0,1,1).
 
-    layers_json is a list of layer entries:
-        [fill, stroke, ptype, polys, bounds]
-    where polys[i] = [x0,y0,x1,y1,...] (flat, 2 dp)
-    and   bounds[i] = [minX,minY,maxX,maxY] (for viewport culling).
+    Each entry in layers_list:
+        [layer_num, fill, stroke, ptype, polys, bounds]
+    polys[i]  = flat [x0,y0,x1,y1,...] (2 dp)
+    bounds[i] = [minX, minY, maxX, maxY]  (pre-computed for cull)
     """
     layer_polys = defaultdict(list)
     all_x, all_y = [], []
 
-    for cell in top_cells:
-        for poly in cell.get_polygons():
-            pts = poly.points
-            if len(pts) < 3:
-                continue
-            xs = pts[:, 0]
-            ys = -pts[:, 1]          # flip Y: GDS y-up → canvas y-down
-            all_x.extend(xs.tolist())
-            all_y.extend(ys.tolist())
+    for poly in cell.get_polygons():
+        pts = poly.points
+        if len(pts) < 3:
+            continue
+        xs = pts[:, 0]
+        ys = -pts[:, 1]          # flip Y
+        all_x.extend(xs.tolist())
+        all_y.extend(ys.tolist())
 
-            flat = []
-            for x, y in zip(xs.tolist(), ys.tolist()):
-                flat.append(round(x, 2))
-                flat.append(round(y, 2))
+        flat = []
+        for x, y in zip(xs.tolist(), ys.tolist()):
+            flat.append(round(x, 2))
+            flat.append(round(y, 2))
 
-            bx0, bx1 = float(xs.min()), float(xs.max())
-            by0, by1 = float(ys.min()), float(ys.max())
-            layer_polys[poly.layer].append((flat, bx0, by0, bx1, by1))
+        bx0, bx1 = float(xs.min()), float(xs.max())
+        by0, by1 = float(ys.min()), float(ys.max())
+        layer_polys[poly.layer].append((flat, bx0, by0, bx1, by1))
 
     if not all_x:
         return None, 0, 0, 1, 1
@@ -96,23 +94,23 @@ def _build_canvas_data(top_cells, layer_colors=None):
     vb_w = float(mx_x - mn_x + 2 * pad)
     vb_h = float(mx_y - mn_y + 2 * pad)
 
-    layers_data = []
-    for i, layer in enumerate(sorted(layer_polys)):
+    layers_list = []
+    for i, layer_num in enumerate(sorted(layer_polys)):
         style        = _LAYER_STYLES[i % len(_LAYER_STYLES)]
-        fill_color   = (layer_colors or {}).get(layer, style[0])
+        fill_color   = (layer_colors or {}).get(layer_num, style[0])
         stroke_color = style[1]
         ptype        = style[2]
 
         polys  = []
         bounds = []
-        for (flat, bx0, by0, bx1, by1) in layer_polys[layer]:
+        for (flat, bx0, by0, bx1, by1) in layer_polys[layer_num]:
             polys.append(flat)
             bounds.append([round(bx0, 2), round(by0, 2),
                            round(bx1, 2), round(by1, 2)])
 
-        layers_data.append([fill_color, stroke_color, ptype, polys, bounds])
+        layers_list.append([layer_num, fill_color, stroke_color, ptype, polys, bounds])
 
-    return json.dumps(layers_data, separators=(',', ':')), vb_x, vb_y, vb_w, vb_h
+    return layers_list, vb_x, vb_y, vb_w, vb_h
 
 
 def show_interactive_viewer():
@@ -167,36 +165,54 @@ def show_interactive_viewer():
 
                 layer_colors = _parse_lyp(uploaded_lyp.read()) if uploaded_lyp else None
 
-                layers_json, vb_x, vb_y, vb_w, vb_h = _build_canvas_data(
-                    top_cells, layer_colors)
-                if layers_json is None:
+                # Build data for every cell in the library that has geometry.
+                # top-level cells are listed first; the rest follow alphabetically.
+                top_names  = [c.name for c in top_cells]
+                try:
+                    all_lib_cells = list(lib.cells)
+                except Exception:
+                    all_lib_cells = list(top_cells)
+
+                non_top = sorted(
+                    [c for c in all_lib_cells if c.name not in top_names],
+                    key=lambda c: c.name)
+                ordered_cells = list(top_cells) + non_top
+
+                all_cells_data = {}
+                for cell in ordered_cells:
+                    layers_list, vb_x, vb_y, vb_w, vb_h = _build_cell_data(
+                        cell, layer_colors)
+                    if layers_list is not None:
+                        all_cells_data[cell.name] = {
+                            "b": [vb_x, vb_y, vb_w, vb_h],
+                            "l": layers_list,
+                        }
+
+                if not all_cells_data:
                     st.error("No geometry found in GDS file.")
                     return
 
-                unit = _unit_label(lib.unit)
+                # Initial cell = first top-level cell that has geometry
+                init_cell = next(
+                    (n for n in top_names if n in all_cells_data),
+                    next(iter(all_cells_data)))
 
-                # ------------------------------------------------------------------
-                # HTML: Canvas-based viewer modelled after KLayout's rendering loop.
-                #
-                # Key design decisions (why it's fast):
-                #  1. <canvas> immediate-mode — no DOM node per polygon, no retained
-                #     scene graph, no SVG pattern recomputation on every pan/zoom.
-                #  2. Viewport culling — each polygon's pre-computed AABB is tested
-                #     against the world-space viewport; off-screen polys are skipped.
-                #  3. Constant-pixel hatch tiles — CanvasPattern tiles are 14 px
-                #     offscreen canvases; they never rescale with zoom.
-                #  4. Simple state: (sc, tx, ty). Pan = tx/ty +=, zoom = sc *= factor.
-                #     No DOM attribute writes, no layout invalidation.
-                # ------------------------------------------------------------------
+                unit           = _unit_label(lib.unit)
+                all_cells_json = json.dumps(all_cells_data, separators=(',', ':'))
+                top_names_json = json.dumps(top_names,      separators=(',', ':'))
+                init_cell_json = json.dumps(init_cell)
+
                 html = f"""<!DOCTYPE html>
 <html><head><style>
 *{{margin:0;padding:0;box-sizing:border-box}}
 body{{background:#d4d0c8;overflow:hidden;
-     font-family:"MS Sans Serif",Arial,sans-serif;font-size:11px}}
+     font-family:"MS Sans Serif",Arial,sans-serif;font-size:11px;color:#000}}
 
+/* ── toolbar ── */
 #toolbar{{
   background:#d4d0c8;border-bottom:1px solid #808080;
   padding:4px 6px;display:flex;gap:4px;align-items:center;user-select:none;
+  flex-shrink:0;
 }}
 .btn{{
   background:#d4d0c8;color:#000;
@@ -204,7 +220,7 @@ body{{background:#d4d0c8;overflow:hidden;
   padding:3px 10px;cursor:pointer;
   border-top:2px solid #dfdfdf;border-left:2px solid #dfdfdf;
   border-bottom:2px solid #404040;border-right:2px solid #404040;
-  outline:1px solid #000;white-space:nowrap;min-width:72px;text-align:center;
+  outline:1px solid #000;white-space:nowrap;min-width:60px;text-align:center;
 }}
 .btn:active,.btn.on{{
   border-top:2px solid #404040;border-left:2px solid #404040;
@@ -214,12 +230,15 @@ body{{background:#d4d0c8;overflow:hidden;
 .btn:focus{{outline:1px dotted #000;outline-offset:-4px}}
 .sep{{width:1px;height:20px;background:#808080;border-right:1px solid #fff;margin:0 2px}}
 
+/* ── body row: canvas + sidebar ── */
+#body{{display:flex;flex:1;overflow:hidden;}}
+
+/* ── canvas wrap ── */
 #wrap{{
-  position:relative;width:100%;height:600px;
+  position:relative;flex:1;
   background:#1e1e2e;overflow:hidden;cursor:crosshair;
 }}
 canvas{{display:block;}}
-
 #selbox{{
   position:absolute;display:none;pointer-events:none;
   border:1px dashed #fff;background:rgba(100,160,255,.12);
@@ -230,29 +249,119 @@ canvas{{display:block;}}
 }}
 #rbar{{height:3px;background:#e0e0e0;border-radius:1px;margin-bottom:4px}}
 #rlabel{{text-align:center;text-shadow:0 0 4px #000}}
-</style></head><body>
+
+/* ── Win98 sidebar ── */
+#sidebar{{
+  width:168px;min-width:168px;
+  background:#d4d0c8;
+  border-left:2px solid #808080;
+  display:flex;flex-direction:column;
+  overflow:hidden;
+}}
+
+/* Win98 group-box */
+.gb{{
+  margin:6px 4px 0 4px;
+  border-top:1px solid #808080;border-left:1px solid #808080;
+  border-bottom:1px solid #dfdfdf;border-right:1px solid #dfdfdf;
+  flex-shrink:0;
+}}
+.gb.stretch{{flex:1;display:flex;flex-direction:column;overflow:hidden;min-height:80px}}
+.gb-title{{
+  background:#d4d0c8;
+  font:bold 11px "MS Sans Serif",Arial,sans-serif;
+  padding:2px 5px;
+  border-bottom:1px solid #808080;
+  user-select:none;
+}}
+
+/* Win98 listbox (cells) */
+#cellSel{{
+  display:block;width:100%;
+  background:#fff;color:#000;
+  font:11px "MS Sans Serif",Arial,sans-serif;
+  border:none;outline:none;
+  padding:0;margin:0;
+  flex:1;
+  overflow-y:auto;
+}}
+#cellSel option{{padding:1px 4px;}}
+#cellSel option.top-cell{{font-weight:bold;}}
+
+/* layer list */
+#layerScroll{{
+  overflow-y:auto;flex:1;
+  padding:2px 2px;
+}}
+.lr{{
+  display:flex;align-items:center;gap:3px;
+  padding:1px 2px;cursor:pointer;user-select:none;
+}}
+.lr:hover{{background:#b0b8c8}}
+.lr input[type=checkbox]{{
+  width:12px;height:12px;margin:0;flex-shrink:0;cursor:pointer;
+}}
+.swatch{{
+  flex-shrink:0;
+  border-top:1px solid #808080;border-left:1px solid #808080;
+  border-bottom:1px solid #dfdfdf;border-right:1px solid #dfdfdf;
+}}
+.lr label{{
+  font:11px "MS Sans Serif",Arial,sans-serif;
+  white-space:nowrap;overflow:hidden;text-overflow:ellipsis;
+  cursor:pointer;
+}}
+.lr.hidden label{{color:#808080;text-decoration:line-through;}}
+
+/* outer shell takes full viewport */
+html,body{{height:100%;overflow:hidden;}}
+#shell{{display:flex;flex-direction:column;height:100%;}}
+</style></head>
+<body><div id="shell">
 
 <div id="toolbar">
-  <button class="btn on" id="bPan"  title="Pan – drag to move">&#128336; Pan</button>
-  <button class="btn"    id="bBox"  title="Box Zoom – drag rectangle">&#9974; Box Zoom</button>
+  <button class="btn on" id="bPan"  title="Pan">&#128336; Pan</button>
+  <button class="btn"    id="bBox"  title="Box Zoom">&#9974; Box&nbsp;Zoom</button>
   <div class="sep"></div>
-  <button class="btn"    id="bReset" title="Fit layout (double-click also works)">&#8635; Reset</button>
+  <button class="btn"    id="bReset" title="Fit (double-click also works)">&#8635; Reset</button>
 </div>
 
-<div id="wrap">
-  <canvas id="cv"></canvas>
-  <div id="selbox"></div>
-  <div id="ruler"><div id="rbar"></div><div id="rlabel"></div></div>
+<div id="body">
+  <div id="wrap">
+    <canvas id="cv"></canvas>
+    <div id="selbox"></div>
+    <div id="ruler"><div id="rbar"></div><div id="rlabel"></div></div>
+  </div>
+
+  <div id="sidebar">
+    <div class="gb">
+      <div class="gb-title">Cells</div>
+      <select id="cellSel" size="5"></select>
+    </div>
+    <div class="gb stretch">
+      <div class="gb-title">Layers</div>
+      <div id="layerScroll"></div>
+    </div>
+  </div>
 </div>
+
+</div><!-- #shell -->
 
 <script>
-// ── Data from Python ─────────────────────────────────────────────────────
-const LAYERS = {layers_json};
-const UNIT   = "{unit}";
-const GX={vb_x:.6f}, GY={vb_y:.6f}, GW={vb_w:.6f}, GH={vb_h:.6f};
-const PSIZE  = 14;   // hatch tile size in screen pixels (constant)
+// ── Data injected by Python ───────────────────────────────────────────────
+const ALL_CELLS  = {all_cells_json};
+const TOP_NAMES  = {top_names_json};
+const INIT_CELL  = {init_cell_json};
+const UNIT       = "{unit}";
+const PSIZE      = 14;   // hatch tile size in px (constant, never rescales)
 
-// ── Canvas setup ─────────────────────────────────────────────────────────
+// ── State ─────────────────────────────────────────────────────────────────
+let LAYERS   = [];        // current cell's layer list
+let GX, GY, GW, GH;      // current cell's world bounds
+let patterns = [];        // CanvasPattern per layer (rebuilt on cell change)
+const hiddenNums = new Set();  // layer numbers toggled off (persists across cells)
+
+// ── Canvas / DOM refs ─────────────────────────────────────────────────────
 const wrap = document.getElementById('wrap');
 const cv   = document.getElementById('cv');
 const sel  = document.getElementById('selbox');
@@ -263,29 +372,22 @@ function resizeCanvas(){{
   cv.height = wrap.offsetHeight;
 }}
 
-// ── Build hatch CanvasPatterns (offscreen canvas, fixed px size) ──────────
-// Patterns are constant-pixel-size regardless of zoom: no recomputation needed.
+// ── Hatch pattern builder (offscreen 14×14 canvas tile) ──────────────────
 function buildPattern(fill, stroke, ptype){{
   const oc = document.createElement('canvas');
   oc.width = oc.height = PSIZE;
-  const p = oc.getContext('2d');
-  const s = PSIZE, h = s / 2, lw = Math.max(1, s * 0.11);
-
-  // semi-transparent fill background
-  p.fillStyle = fill;
+  const p  = oc.getContext('2d');
+  const s  = PSIZE, h = s / 2, lw = Math.max(1, s * 0.11);
+  p.fillStyle   = fill;
   p.globalAlpha = 0.50;
   p.fillRect(0, 0, s, s);
   p.globalAlpha = 0.85;
-
   p.strokeStyle = stroke;
   p.lineWidth   = lw;
   p.lineCap     = 'butt';
-
   if (ptype === 'dots') {{
     p.fillStyle = stroke;
-    p.beginPath();
-    p.arc(h, h, s * 0.15, 0, Math.PI * 2);
-    p.fill();
+    p.beginPath(); p.arc(h, h, s * 0.15, 0, Math.PI * 2); p.fill();
   }} else {{
     p.beginPath();
     switch (ptype) {{
@@ -293,24 +395,119 @@ function buildPattern(fill, stroke, ptype){{
       case 'vlines':  p.moveTo(h,0);  p.lineTo(h,s); break;
       case 'diag45':  p.moveTo(0,0);  p.lineTo(s,s); break;
       case 'diag135': p.moveTo(s,0);  p.lineTo(0,s); break;
-      case 'cross':
-        p.moveTo(0,h); p.lineTo(s,h);
-        p.moveTo(h,0); p.lineTo(h,s); break;
-      case 'xcross':
-        p.moveTo(0,0); p.lineTo(s,s);
-        p.moveTo(s,0); p.lineTo(0,s); break;
+      case 'cross':   p.moveTo(0,h);  p.lineTo(s,h);
+                      p.moveTo(h,0);  p.lineTo(h,s); break;
+      case 'xcross':  p.moveTo(0,0);  p.lineTo(s,s);
+                      p.moveTo(s,0);  p.lineTo(0,s); break;
     }}
     p.stroke();
   }}
   return ctx.createPattern(oc, 'repeat');
 }}
 
-const patterns = LAYERS.map(([fill, stroke, ptype]) => buildPattern(fill, stroke, ptype));
+// Tiny swatch (22×14) rendered into a <canvas> element
+function drawSwatch(sw, fill, stroke, ptype){{
+  const sc2 = sw.getContext('2d');
+  const ps2 = 7;  // smaller tile for thumbnail
+  const oc  = document.createElement('canvas');
+  oc.width  = oc.height = ps2;
+  const p   = oc.getContext('2d');
+  const s   = ps2, h = s / 2;
+  p.fillStyle   = fill;   p.globalAlpha = 0.50; p.fillRect(0, 0, s, s);
+  p.globalAlpha = 0.85;   p.strokeStyle = stroke;
+  p.lineWidth   = Math.max(1, s * 0.11); p.lineCap = 'butt';
+  if (ptype === 'dots') {{
+    p.fillStyle = stroke; p.beginPath();
+    p.arc(h, h, s * 0.15, 0, Math.PI * 2); p.fill();
+  }} else {{
+    p.beginPath();
+    switch (ptype) {{
+      case 'hlines':  p.moveTo(0,h);  p.lineTo(s,h); break;
+      case 'vlines':  p.moveTo(h,0);  p.lineTo(h,s); break;
+      case 'diag45':  p.moveTo(0,0);  p.lineTo(s,s); break;
+      case 'diag135': p.moveTo(s,0);  p.lineTo(0,s); break;
+      case 'cross':   p.moveTo(0,h);  p.lineTo(s,h);
+                      p.moveTo(h,0);  p.lineTo(h,s); break;
+      case 'xcross':  p.moveTo(0,0);  p.lineTo(s,s);
+                      p.moveTo(s,0);  p.lineTo(0,s); break;
+    }}
+    p.stroke();
+  }}
+  const pat = sc2.createPattern(oc, 'repeat');
+  sc2.fillStyle = pat;
+  sc2.fillRect(0, 0, sw.width, sw.height);
+  sc2.strokeStyle = '#555'; sc2.lineWidth = 1;
+  sc2.strokeRect(0.5, 0.5, sw.width - 1, sw.height - 1);
+}}
 
-// ── View state ────────────────────────────────────────────────────────────
-// sc  = pixels per GDS unit
-// tx  = screen x of GDS origin
-// ty  = screen y of GDS origin
+// ── Layer panel ───────────────────────────────────────────────────────────
+function buildLayerPanel(){{
+  const list = document.getElementById('layerScroll');
+  list.innerHTML = '';
+  LAYERS.forEach(([lnum, fill, stroke, ptype], i) => {{
+    const row = document.createElement('div');
+    row.className = 'lr' + (hiddenNums.has(lnum) ? ' hidden' : '');
+    row.id = 'lr' + i;
+
+    const cb  = document.createElement('input');
+    cb.type   = 'checkbox';
+    cb.id     = 'lc' + i;
+    cb.checked = !hiddenNums.has(lnum);
+
+    const sw  = document.createElement('canvas');
+    sw.className = 'swatch';
+    sw.width  = 22; sw.height = 14;
+
+    const lbl = document.createElement('label');
+    lbl.htmlFor   = 'lc' + i;
+    lbl.textContent = 'Layer ' + lnum;
+
+    row.appendChild(cb);
+    row.appendChild(sw);
+    row.appendChild(lbl);
+    list.appendChild(row);
+
+    drawSwatch(sw, fill, stroke, ptype);
+
+    cb.addEventListener('change', () => {{
+      if (cb.checked) hiddenNums.delete(lnum);
+      else            hiddenNums.add(lnum);
+      row.className = 'lr' + (hiddenNums.has(lnum) ? ' hidden' : '');
+      render();
+    }});
+  }});
+}}
+
+// ── Cell selector ─────────────────────────────────────────────────────────
+function buildCellSelector(){{
+  const sel2 = document.getElementById('cellSel');
+  sel2.innerHTML = '';
+
+  // top-level cells first (bold via CSS class), then the rest
+  const topSet = new Set(TOP_NAMES);
+  Object.keys(ALL_CELLS).forEach(name => {{
+    const opt   = document.createElement('option');
+    opt.value   = name;
+    opt.textContent = name;
+    if (topSet.has(name)) opt.className = 'top-cell';
+    sel2.appendChild(opt);
+  }});
+  sel2.value = INIT_CELL;
+  sel2.addEventListener('change', () => loadCell(sel2.value));
+}}
+
+// ── Load a cell by name ───────────────────────────────────────────────────
+function loadCell(name){{
+  const cd = ALL_CELLS[name];
+  if (!cd) return;
+  LAYERS    = cd.l;
+  [GX, GY, GW, GH] = cd.b;
+  patterns  = LAYERS.map(([,fill,stroke,ptype]) => buildPattern(fill, stroke, ptype));
+  buildLayerPanel();
+  if (cv.width) {{ fitView(); render(); }}
+}}
+
+// ── View state: sc=px/GDSunit, tx/ty=screen pos of world origin ──────────
 let sc, tx, ty, iSc, iTx, iTy;
 
 function fitView(){{
@@ -333,32 +530,26 @@ function updateRuler(){{
     (gl % 1 === 0 ? gl : gl.toPrecision(3)) + ' ' + UNIT;
 }}
 
-// ── Render loop ───────────────────────────────────────────────────────────
-// KLayout-style: clear canvas, iterate layers → polygons, cull off-screen,
-// draw screen-space paths with constant-pixel hatch pattern fill.
+// ── Render ────────────────────────────────────────────────────────────────
 function render(){{
   const W = cv.width, H = cv.height;
   ctx.clearRect(0, 0, W, H);
 
-  // World bounds of the current viewport (for AABB culling)
   const wxMin = -tx / sc,       wyMin = -ty / sc;
   const wxMax = (W - tx) / sc,  wyMax = (H - ty) / sc;
 
   for (let li = 0; li < LAYERS.length; li++) {{
-    const [fill, stroke, ptype, polys, bounds] = LAYERS[li];
-    const pat = patterns[li];
+    const [lnum, fill, stroke, ptype, polys, bounds] = LAYERS[li];
+    if (hiddenNums.has(lnum)) continue;
 
-    // Anchor pattern to world origin so it stays fixed during pan/zoom
-    // (tx%PSIZE keeps translation in [0,PSIZE) without affecting repeat phase)
-    pat.setTransform(new DOMMatrix([1,0,0,1, tx % PSIZE, ty % PSIZE]));
+    const pat = patterns[li];
+    pat.setTransform(new DOMMatrix([1, 0, 0, 1, tx % PSIZE, ty % PSIZE]));
     ctx.fillStyle = pat;
 
     for (let pi = 0; pi < polys.length; pi++) {{
-      // Viewport cull — cheap AABB test using pre-computed bounding boxes
       const [bx0, by0, bx1, by1] = bounds[pi];
       if (bx1 < wxMin || bx0 > wxMax || by1 < wyMin || by0 > wyMax) continue;
 
-      // Draw polygon in screen space
       const poly = polys[pi];
       ctx.beginPath();
       ctx.moveTo(poly[0] * sc + tx, poly[1] * sc + ty);
@@ -371,29 +562,27 @@ function render(){{
   updateRuler();
 }}
 
-// ── Init: wait for layout, then fit & render ─────────────────────────────
+// ── Init ─────────────────────────────────────────────────────────────────
 function init(){{
   if (!wrap.offsetWidth) {{ requestAnimationFrame(init); return; }}
   resizeCanvas();
-  fitView();
-  render();
+  buildCellSelector();
+  loadCell(INIT_CELL);
 }}
 requestAnimationFrame(init);
 
-// ── Mode ─────────────────────────────────────────────────────────────────
+// ── Toolbar mode ──────────────────────────────────────────────────────────
 let mode = 'pan';
 function setMode(m){{
   mode = m;
   ['bPan','bBox'].forEach(id => document.getElementById(id).classList.remove('on'));
   document.getElementById(m === 'pan' ? 'bPan' : 'bBox').classList.add('on');
 }}
-document.getElementById('bPan').addEventListener('click', () => setMode('pan'));
-document.getElementById('bBox').addEventListener('click', () => setMode('zoombox'));
-document.getElementById('bReset').addEventListener('click', () => {{
-  sc=iSc; tx=iTx; ty=iTy; render();
-}});
+document.getElementById('bPan').addEventListener('click',  () => setMode('pan'));
+document.getElementById('bBox').addEventListener('click',  () => setMode('zoombox'));
+document.getElementById('bReset').addEventListener('click', () => {{ sc=iSc;tx=iTx;ty=iTy;render(); }});
 
-// ── Scroll-wheel zoom toward cursor ───────────────────────────────────────
+// ── Scroll-wheel zoom ─────────────────────────────────────────────────────
 wrap.addEventListener('wheel', e => {{
   e.preventDefault();
   const r  = wrap.getBoundingClientRect();
@@ -405,7 +594,7 @@ wrap.addEventListener('wheel', e => {{
   render();
 }}, {{passive: false}});
 
-// ── Mouse drag ────────────────────────────────────────────────────────────
+// ── Mouse drag (pan / box-zoom) ───────────────────────────────────────────
 let drag = false, dsx, dsy, dtx, dty, bx0, by0;
 
 wrap.addEventListener('mousedown', e => {{
@@ -441,19 +630,15 @@ window.addEventListener('mouseup', e => {{
   drag = false;
   if (mode === 'zoombox') {{
     sel.style.display = 'none';
-    const r  = wrap.getBoundingClientRect();
-    const cx = Math.max(0, Math.min(r.width,  e.clientX - r.left));
-    const cy = Math.max(0, Math.min(r.height, e.clientY - r.top));
-    let nx0 = Math.min(bx0, cx), ny0 = Math.min(by0, cy);
-    let nw  = Math.abs(cx - bx0), nh  = Math.abs(cy - by0);
+    const r   = wrap.getBoundingClientRect();
+    const cx  = Math.max(0, Math.min(r.width,  e.clientX - r.left));
+    const cy  = Math.max(0, Math.min(r.height, e.clientY - r.top));
+    let nx0   = Math.min(bx0, cx), ny0 = Math.min(by0, cy);
+    let nw    = Math.abs(cx - bx0), nh  = Math.abs(cy - by0);
     if (nw < 6 || nh < 6) return;
-
-    // Aspect-ratio correct the selection box
     const cAR = cv.width / cv.height, sAR = nw / nh;
     if (sAR > cAR) {{ const n = nw / cAR; ny0 -= (n - nh) / 2; nh = n; }}
     else           {{ const n = nh * cAR; nx0 -= (n - nw) / 2; nw = n; }}
-
-    // Zoom: map selection rectangle to full viewport
     const wx0 = (nx0 - tx) / sc, wy0 = (ny0 - ty) / sc;
     sc = sc * cv.width / nw;
     tx = -wx0 * sc;
@@ -465,7 +650,7 @@ window.addEventListener('mouseup', e => {{
 wrap.addEventListener('dblclick', () => {{ sc=iSc; tx=iTx; ty=iTy; render(); }});
 </script></body></html>"""
 
-                components.html(html, height=645)
+                components.html(html, height=660)
                 st.caption("Scroll to zoom · Drag to pan/box-zoom · Double-click to reset")
 
         except Exception as e:
