@@ -2,7 +2,8 @@ import streamlit as st
 import os
 from langchain_groq import ChatGroq
 from langchain_pinecone import PineconeVectorStore, PineconeEmbeddings
-from langchain.chains import RetrievalQA
+# from langchain.chains import RetrievalQA
+from langchain.chains.retrieval_qa.base import RetrievalQA
 
 # DO NOT put your actual keys here anymore!
 # Streamlit will look for these in its "Advanced Settings" later.
