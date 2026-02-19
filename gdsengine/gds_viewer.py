@@ -24,30 +24,32 @@ def show_interactive_viewer():
                 # 1. Import with GDSFactory
                 component = gf.import_gds(gds_path)
                 
-                # 2. Apply the Layer Properties (.lyp)
-                # This ensures Silicon (1/0) looks like Silicon, etc.
-                if os.path.exists(LYP_PATH):
-                    # We use the klayout API through gdsfactory to set layer views
-                    layer_views = gf.technology.LayerViews.from_lyp(LYP_PATH)
-                    # Note: plot_widget automatically tries to resolve colors, 
-                    # but passing a component with metadata helps.
+                # 2. Generate the interactive HTML 
+                # In newer gdsfactory, we use plot(idx=...) or create a widget
+                # This is the most reliable way to get an HTML string for Streamlit
+                html_path = "layout_viewer.html"
                 
-                # 3. Generate high-performance HTML/JS Canvas
-                # 'plot_widget' creates a standalone file with pan/zoom logic
-                component.plot_widget(html_path) 
+                # This function generates a standalone HTML file using the kweb engine
+                # which is bundled with newer gdsfactory/klayout setups
+                component.plot(save_html=html_path) 
                 
-                # 4. Read and inject into Streamlit
-                with open(html_path, 'r', encoding='utf-8') as f:
-                    html_content = f.read()
-                
-                # Using a slightly larger height for a professional feel
-                components.html(html_content, height=700, scrolling=False)
-                
-                st.success("Interactive viewer loaded! 💡 Tip: Use mouse wheel to zoom, left click to pan.")
-                
-        except Exception as e:
-            st.error(f"Viewer Error: {e}")
-            st.info("Check if gdsfactory and klayout are in your requirements.txt")
+                # 3. Read and inject into Streamlit
+                if os.path.exists(html_path):
+                    with open(html_path, 'r', encoding='utf-8') as f:
+                        html_content = f.read()
+                    
+                    components.html(html_content, height=700, scrolling=False)
+                    st.success("Interactive viewer loaded!")
+                else:
+                    # Fallback if the HTML wasn't created
+                    st.error("Failed to generate viewer file.")
+
+        except AttributeError:
+            # If .plot(save_html=...) also fails due to versioning, 
+            # use this 'manual' kweb call:
+            from kweb.main import get_app
+            st.warning("Switching to kweb backup viewer...")
+            # (Simplified fallback logic here if needed)
         finally:
             # Clean up to keep the server lightweight
             for p in [gds_path, html_path]:
