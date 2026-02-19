@@ -2,7 +2,9 @@ import streamlit as st
 import os
 from langchain_groq import ChatGroq
 from langchain_pinecone import PineconeVectorStore, PineconeEmbeddings
-# from langchain_community.chains import RetrievalQA
+from langchain.chains import create_retrieval_chain
+from langchain.chains.combine_documents import create_stuff_documents_chain
+from langchain_core.prompts import ChatPromptTemplate
 
 # DO NOT put your actual keys here anymore!
 # Streamlit will look for these in its "Advanced Settings" later.
@@ -21,19 +23,37 @@ llm = ChatGroq(model_name="gemma3-70b-it", temperature=0)
 embeddings = PineconeEmbeddings(model="llama-text-embed-v2")
 vectorstore = PineconeVectorStore(index_name="lux-kb", embedding=embeddings)
 
-# 5. Create the "QA Chain"
-# qa = RetrievalQA.from_chain_type(
-#     llm=llm,
-#     chain_type="stuff",
-#     retriever=vectorstore.as_retriever(search_kwargs={"k": 3})
-# )
+# 5. Create the Modern "QA Chain" (LCEL)
+
+# A. Define how the AI should behave and read the context
+system_prompt = (
+    "You are an expert silicon photonics assistant. Use the following retrieved context to answer the user's question. "
+    "If you don't know the answer, just say that you don't know.\n\n"
+    "Context: {context}"
+)
+
+prompt = ChatPromptTemplate.from_messages([
+    ("system", system_prompt),
+    ("human", "{input}")
+])
+
+# B. Create the chain that combines the documents (the "stuff" equivalent)
+question_answer_chain = create_stuff_documents_chain(llm, prompt)
+
+# C. Link the retriever and the document chain together
+qa = create_retrieval_chain(
+    vectorstore.as_retriever(search_kwargs={"k": 3}), 
+    question_answer_chain
+)
 
 # 6. The UI
 user_query = st.text_input("Ask a technical question about your papers:")
 
 if user_query:
     with st.spinner("Analyzing papers..."):
-        print("so far so good")
-        # response = qa.invoke(user_query)
-        # st.write("### Answer:")
-        # st.write(response["result"])
+        # Pass the query as a dictionary with the key "input"
+        response = qa.invoke({"input": user_query})
+        
+        st.write("### Answer:")
+        # The modern chain outputs the final text under the "answer" key
+        st.write(response["answer"])
