@@ -2,7 +2,6 @@ import streamlit as st
 import gdsfactory as gf
 import os
 import streamlit.components.v1 as components
-from kweb.api import save_stack
 
 def show_interactive_viewer():
     st.header("🔗 KLayout-Powered Interactive Viewer")
@@ -16,10 +15,11 @@ def show_interactive_viewer():
             f.write(uploaded_file.getbuffer())
         
         try:
+            from kweb.api import save_stack
             with st.spinner("KLayout engine rendering..."):
                 # 1. Load the GDS
                 c = gf.import_gds(gds_path)
-                
+
                 # 2. Use kweb's internal exporter to create the HTML file
                 # This bypasses the 'plot' TypeError and goes straight to the source
                 save_stack(c, html_path)
