@@ -12,12 +12,7 @@ python-dotenv
 pypdf
 
 # for the gds viewer
-gdstk
-plotly
 klayout
 pillow
-pandas
-gdsfactory>=8.0.0
-kweb>=1.1.9
-klayout
-jinja2
+gdstk
+plotly

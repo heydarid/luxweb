@@ -18,4 +18,6 @@ def get_klayout_snapshot(gds_path, width=1200, height=800):
         view.load_layer_props(LYP_PATH)
     
     view.zoom_fit()
-    # ... rest of your rendering code ...
+    img_path = gds_path.replace(".gds", "_preview.png")
+    view.save_image(img_path, width, height)
+    return img_path
