@@ -86,40 +86,27 @@ def _svg_transform(ox, oy, rotation, magnification, x_reflection):
         parts.append("scale(1,-1)")
     return " ".join(parts)
 
-def _build_svg(top_cells, layer_colors=None):
-    """Hierarchical SVG using <defs>/<symbol>/<use> — no polygon flattening.
-
-    Each unique cell is defined once as a <symbol>; repeated instances become
-    lightweight <use> elements, exactly mirroring KLayout's hierarchical render.
-    A single top-level <g transform='scale(1,-1)'> flips GDS y-up → SVG y-down.
-
-    Returns (svg_str, vb_x, vb_y, vb_w, vb_h).
-    """
+def _build_svg(top_cells, layer_colors=None, use_hatches=True, density=0.01):
     def color_for(layer):
         if layer_colors and layer in layer_colors:
             return layer_colors[layer]
         return _LAYER_COLORS[layer % len(_LAYER_COLORS)]
 
     visited = set()
-    symbols = []   # built depth-first so every symbol is defined before use
-    all_layers = set()  # every layer number seen in any polygon
+    symbols = []
+    all_layers = set()
 
     def process(cell):
-        if cell.name in visited:
-            return
+        if cell.name in visited: return
         visited.add(cell.name)
 
-        # Process sub-cells first (depth-first)
         for ref in cell.references:
-            if ref.cell:
-                process(ref.cell)
+            if ref.cell: process(ref.cell)
 
-        # ── Direct polygons (only this cell, no recursion) ──
         lpaths = defaultdict(list)
         for poly in cell.polygons:
             pts = poly.points
-            if len(pts) < 2:
-                continue
+            if len(pts) < 2: continue
             coords = " L".join(f"{x:.3f},{y:.3f}" for x, y in zip(pts[:, 0], pts[:, 1]))
             lpaths[poly.layer].append(f"M{coords}Z")
             all_layers.add(poly.layer)
@@ -127,66 +114,45 @@ def _build_svg(top_cells, layer_colors=None):
         parts = []
         for layer in sorted(lpaths):
             d = " ".join(lpaths[layer])
+            # Determine fill based on toggle
+            fill_val = f"url(#pat_L{layer})" if use_hatches else color_for(layer)
+            fill_op = "1.0" if use_hatches else "0.5"
+            
             parts.append(
-                f'<path d="{d}" fill="url(#pat_L{layer})" stroke="none"/>'
+                f'<path d="{d}" fill="{fill_val}" fill-opacity="{fill_op}" stroke="none"/>'
             )
 
-        # ── References → <use> elements ──
         for ref in cell.references:
-            if not ref.cell:
-                continue
+            if not ref.cell: continue
             sub_id = _svg_id(ref.cell.name)
-            ox, oy   = ref.origin        if ref.origin        is not None else (0.0, 0.0)
-            rot      = ref.rotation      if ref.rotation      is not None else 0.0
-            mag      = ref.magnification if ref.magnification is not None else 1.0
-            xrefl    = ref.x_reflection  if ref.x_reflection  is not None else False
+            t = _svg_transform(ref.origin[0], ref.origin[1], ref.rotation, ref.magnification, ref.x_reflection)
+            parts.append(f'<use href="#{sub_id}" transform="{t}"/>')
 
-            if ref.repetition:
-                # Array reference: expand into one <use> per instance
-                for off in ref.repetition.offsets():
-                    t = _svg_transform(ox + off[0], oy + off[1], rot, mag, xrefl)
-                    parts.append(f'<use href="#{sub_id}" transform="{t}"/>')
-            else:
-                t = _svg_transform(ox, oy, rot, mag, xrefl)
-                parts.append(f'<use href="#{sub_id}" transform="{t}"/>')
+        symbols.append(f'<symbol id="{_svg_id(cell.name)}" overflow="visible">{"".join(parts)}</symbol>')
 
-        symbols.append(
-            f'<symbol id="{_svg_id(cell.name)}" overflow="visible">{"".join(parts)}</symbol>'
-        )
+    for cell in top_cells: process(cell)
 
-    for cell in top_cells:
-        process(cell)
-
-    if not symbols:
-        return None, 0, 0, 1, 1
-
-    # ── Bounding box via gdstk (fast, uses C++ internally) ──
+    # Calculate bounding box for pattern scaling
     bbox = None
     for cell in top_cells:
         bb = cell.bounding_box()
-        if bb is None:
-            continue
-        (xmin, ymin), (xmax, ymax) = bb
-        if bbox is None:
-            bbox = [xmin, ymin, xmax, ymax]
-        else:
-            bbox[0] = min(bbox[0], xmin)
-            bbox[1] = min(bbox[1], ymin)
-            bbox[2] = max(bbox[2], xmax)
-            bbox[3] = max(bbox[3], ymax)
+        if bb:
+            (xmin, ymin), (xmax, ymax) = bb
+            if bbox is None: bbox = [xmin, ymin, xmax, ymax]
+            else:
+                bbox[0]=min(bbox[0],xmin); bbox[1]=min(bbox[1],ymin)
+                bbox[2]=max(bbox[2],xmax); bbox[3]=max(bbox[3],ymax)
 
-    if bbox is None:
-        return None, 0, 0, 1, 1
+    xmin, ymin, xmax, ymax = bbox or (0,0,1,1)
+    
+    # ── Hatch Generation ──
+    patterns = []
+    if use_hatches:
+        ps = (xmax - xmin) * density # Scale pattern cell to layout size
+        for i, layer in enumerate(sorted(all_layers)):
+            patterns.append(_hatch_pattern(f"pat_L{layer}", color_for(layer), ps, i))
 
-    xmin, ymin, xmax, ymax = bbox
-    pad  = max(xmax - xmin, ymax - ymin) * 0.02 or 1
-    vb_x = xmin - pad
-    vb_y = -(ymax + pad)          # SVG y = -GDS y after the global flip
-    vb_w = xmax - xmin + 2 * pad
-    vb_h = ymax - ymin + 2 * pad
-
-    top_uses = "".join(f'<use href="#{_svg_id(c.name)}"/>' for c in top_cells)
-    defs     = "<defs>" + "".join(symbols) + "</defs>"
+    defs = "<defs>" + "".join(patterns) + "".join(symbols) + "</defs>"
 
     svg = (
         f'<svg id="gds" xmlns="http://www.w3.org/2000/svg" '
@@ -202,6 +168,12 @@ def _build_svg(top_cells, layer_colors=None):
 
 def show_interactive_viewer():
     st.header("🔗 KLayout-Powered Interactive Viewer")
+    
+    # --- Windows 98 Style Sidebar Controls ---
+    st.sidebar.markdown("### 🖥️ Display Settings")
+    show_hatches = st.sidebar.checkbox("Enable Hatching", value=True)
+    hatch_density = st.sidebar.slider("Hatch Density", 0.001, 0.05, 0.01, step=0.005, format="%.3f")
+
     col1, col2 = st.columns([3, 2])
     with col1:
         uploaded_file = st.file_uploader("Upload GDSII", type=["gds"], key="kweb_uploader")
@@ -215,16 +187,19 @@ def show_interactive_viewer():
 
         try:
             import gdstk
-
             with st.spinner("Rendering layout..."):
                 lib = gdstk.read_gds(gds_path)
                 top_cells = lib.top_level()
-                if not top_cells:
-                    st.error("No top-level cell found in GDS file.")
-                    return
-
+                
                 layer_colors = _parse_lyp(uploaded_lyp.getvalue()) if uploaded_lyp else None
-                svg, vb_x, vb_y, vb_w, vb_h = _build_svg(top_cells, layer_colors)
+                
+                # Pass UI settings into the build function
+                svg, vb_x, vb_y, vb_w, vb_h = _build_svg(
+                    top_cells, 
+                    layer_colors, 
+                    use_hatches=show_hatches, 
+                    density=hatch_density
+                )
                 if not svg:
                     st.error("No geometry found in GDS file.")
                     return
