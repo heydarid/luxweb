@@ -5,17 +5,34 @@ from langchain_pinecone import PineconeVectorStore, PineconeEmbeddings
 from langchain_classic.chains import create_retrieval_chain
 from langchain_classic.chains.combine_documents import create_stuff_documents_chain
 from langchain_core.prompts import ChatPromptTemplate
+from gds_viewer import show_gds_viewer
 
 # DO NOT put your actual keys here anymore!
 # Streamlit will look for these in its "Advanced Settings" later.
 os.environ["GROQ_API_KEY"] = st.secrets["GROQ_API_KEY"]
 os.environ["PINECONE_API_KEY"] = st.secrets["PINECONE_API_KEY"]
 
-# 2. Page Config
+# 2. Page Config & Tabs
 st.set_page_config(page_title="LuxAgent Photonics", page_icon="💡")
-st.title("💡 LuxAgent: Silicon Photonics Expert")
-st.markdown("Querying your private cloud-hosted knowledge base.")
 
+# Create Tabs
+tab1, tab2 = st.tabs(["💬 AI Assistant", "🏗️ GDS Viewer"])
+
+with tab1:
+    st.title("💡 LuxAgent: Silicon Photonics Expert")
+    user_query = st.text_input("Ask a technical question about your papers:")
+    
+    if user_query:
+        with st.spinner("Analyzing..."):
+            response = qa.invoke({"input": user_query})
+            st.write("### Answer:")
+            st.write(response["answer"])
+
+with tab2:
+    # Call the function from your separate file
+    show_gds_viewer()
+
+#### RAG and LLM ####
 # Highly recommended for RAG and technical analysis
 llm = ChatGroq(model_name="llama-3.3-70b-versatile", temperature=0)
 

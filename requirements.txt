@@ -10,3 +10,7 @@ langchain-chroma
 sentence-transformers
 python-dotenv
 pypdf
+
+# for the gds viewer
+gdstk
+plotly
