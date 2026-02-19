@@ -2,7 +2,7 @@ import streamlit as st
 import gdsfactory as gf
 import os
 import streamlit.components.v1 as components
-from kweb.main import save_stack # This is the "magic" exporter
+from kweb.main import save_stack
 
 def show_interactive_viewer():
     st.header("🔗 KLayout-Powered Interactive Viewer")

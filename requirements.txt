@@ -17,5 +17,7 @@ plotly
 klayout
 pillow
 pandas
-kweb
-gdsfactory
+gdsfactory>=8.0.0
+kweb>=1.1.9
+klayout
+jinja2
