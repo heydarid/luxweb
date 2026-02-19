@@ -1,5 +1,6 @@
 import streamlit as st
 import os
+import xml.etree.ElementTree as ET
 from collections import defaultdict
 import streamlit.components.v1 as components
 
@@ -15,9 +16,34 @@ def _unit_label(lib_unit):
     if abs(lib_unit - 1e-3) < 1e-6:  return "mm"
     return "u"
 
-def _build_svg(top_cells):
+def _parse_lyp(lyp_bytes):
+    """Parse a KLayout .lyp XML file.
+    Returns {layer_number: hex_color} for visible layers only.
+    source format: 'layer/datatype@cellview'  e.g. '1/0@1'
+    """
+    layer_colors = {}
+    try:
+        root = ET.fromstring(lyp_bytes)
+        for props in root.findall(".//properties"):
+            if props.findtext("visible", "true").strip().lower() == "false":
+                continue
+            source = props.findtext("source", "").strip()
+            color  = props.findtext("fill-color", "").strip()
+            if not source or not color:
+                continue
+            try:
+                layer = int(source.split("/")[0])
+                layer_colors[layer] = color
+            except (ValueError, IndexError):
+                continue
+    except ET.ParseError:
+        pass
+    return layer_colors
+
+def _build_svg(top_cells, layer_colors=None):
     """Returns (svg_str, vb_x, vb_y, vb_w, vb_h).
-    Uses :.3f coordinates — no scientific notation, crisp rendering."""
+    layer_colors: optional {layer_number: hex_color} from a .lyp file.
+    Falls back to _LAYER_COLORS palette for unmapped layers."""
     layer_paths = defaultdict(list)
     all_x, all_y = [], []
 
@@ -46,7 +72,10 @@ def _build_svg(top_cells):
 
     paths_html = ""
     for i, layer in enumerate(sorted(layer_paths)):
-        color = _LAYER_COLORS[i % len(_LAYER_COLORS)]
+        if layer_colors and layer in layer_colors:
+            color = layer_colors[layer]
+        else:
+            color = _LAYER_COLORS[i % len(_LAYER_COLORS)]
         d = " ".join(layer_paths[layer])
         paths_html += (
             f'<path d="{d}" fill="{color}" fill-opacity="0.75" stroke="none"/>\n'
@@ -66,7 +95,11 @@ def _build_svg(top_cells):
 
 def show_interactive_viewer():
     st.header("🔗 KLayout-Powered Interactive Viewer")
-    uploaded_file = st.file_uploader("Upload GDSII", type=["gds"], key="kweb_uploader")
+    col1, col2 = st.columns([3, 2])
+    with col1:
+        uploaded_file = st.file_uploader("Upload GDSII", type=["gds"], key="kweb_uploader")
+    with col2:
+        uploaded_lyp = st.file_uploader("Layer Properties (optional)", type=["lyp"], key="lyp_uploader")
 
     if uploaded_file:
         gds_path = "temp_view.gds"
