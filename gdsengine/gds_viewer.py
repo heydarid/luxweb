@@ -1,5 +1,6 @@
 import streamlit as st
 import os
+import math
 import xml.etree.ElementTree as ET
 from collections import defaultdict
 import streamlit.components.v1 as components
@@ -40,55 +41,130 @@ def _parse_lyp(lyp_bytes):
         pass
     return layer_colors
 
-def _build_svg(top_cells, layer_colors=None):
-    """Returns (svg_str, vb_x, vb_y, vb_w, vb_h).
-    layer_colors: optional {layer_number: hex_color} from a .lyp file.
-    Falls back to _LAYER_COLORS palette for unmapped layers."""
-    layer_paths = defaultdict(list)
-    all_x, all_y = [], []
+def _svg_id(name):
+    """Safe SVG id from a GDS cell name."""
+    return "c" + "".join(c if c.isalnum() or c == "-" else "_" for c in str(name))
 
-    for cell in top_cells:
-        for poly in cell.get_polygons():
+def _svg_transform(ox, oy, rotation, magnification, x_reflection):
+    """SVG transform string for a GDS reference (coordinates NOT yet Y-flipped;
+    the top-level <g transform='scale(1,-1)'> handles the global flip)."""
+    parts = [f"translate({ox:.4f},{oy:.4f})"]
+    if rotation:
+        parts.append(f"rotate({math.degrees(rotation):.4f})")
+    if magnification and abs(magnification - 1.0) > 1e-9:
+        parts.append(f"scale({magnification:.6g})")
+    if x_reflection:
+        parts.append("scale(1,-1)")
+    return " ".join(parts)
+
+def _build_svg(top_cells, layer_colors=None):
+    """Hierarchical SVG using <defs>/<symbol>/<use> — no polygon flattening.
+
+    Each unique cell is defined once as a <symbol>; repeated instances become
+    lightweight <use> elements, exactly mirroring KLayout's hierarchical render.
+    A single top-level <g transform='scale(1,-1)'> flips GDS y-up → SVG y-down.
+
+    Returns (svg_str, vb_x, vb_y, vb_w, vb_h).
+    """
+    def color_for(layer):
+        if layer_colors and layer in layer_colors:
+            return layer_colors[layer]
+        return _LAYER_COLORS[layer % len(_LAYER_COLORS)]
+
+    visited = set()
+    symbols = []   # built depth-first so every symbol is defined before use
+
+    def process(cell):
+        if cell.name in visited:
+            return
+        visited.add(cell.name)
+
+        # Process sub-cells first (depth-first)
+        for ref in cell.references:
+            if ref.cell:
+                process(ref.cell)
+
+        # ── Direct polygons (only this cell, no recursion) ──
+        lpaths = defaultdict(list)
+        for poly in cell.polygons:
             pts = poly.points
             if len(pts) < 2:
                 continue
-            xs = pts[:, 0]
-            ys = -pts[:, 1]   # flip Y: GDS y-up → SVG y-down
-            all_x.extend(xs)
-            all_y.extend(ys)
-            coords = " L".join(f"{x:.3f},{y:.3f}" for x, y in zip(xs, ys))
-            layer_paths[poly.layer].append(f"M{coords}Z")
+            coords = " L".join(f"{x:.3f},{y:.3f}" for x, y in zip(pts[:, 0], pts[:, 1]))
+            lpaths[poly.layer].append(f"M{coords}Z")
 
-    if not all_x:
-        return None, 0, 0, 1, 1
+        parts = []
+        for layer in sorted(lpaths):
+            d = " ".join(lpaths[layer])
+            parts.append(
+                f'<path d="{d}" fill="{color_for(layer)}" fill-opacity="0.75" stroke="none"/>'
+            )
 
-    min_x, max_x = min(all_x), max(all_x)
-    min_y, max_y = min(all_y), max(all_y)
-    pad = max(max_x - min_x, max_y - min_y) * 0.02 or 1
-    vb_x = min_x - pad
-    vb_y = min_y - pad
-    vb_w = max_x - min_x + 2 * pad
-    vb_h = max_y - min_y + 2 * pad
+        # ── References → <use> elements ──
+        for ref in cell.references:
+            if not ref.cell:
+                continue
+            sub_id = _svg_id(ref.cell.name)
+            ox, oy   = ref.origin        if ref.origin        is not None else (0.0, 0.0)
+            rot      = ref.rotation      if ref.rotation      is not None else 0.0
+            mag      = ref.magnification if ref.magnification is not None else 1.0
+            xrefl    = ref.x_reflection  if ref.x_reflection  is not None else False
 
-    paths_html = ""
-    for i, layer in enumerate(sorted(layer_paths)):
-        if layer_colors and layer in layer_colors:
-            color = layer_colors[layer]
-        else:
-            color = _LAYER_COLORS[i % len(_LAYER_COLORS)]
-        d = " ".join(layer_paths[layer])
-        paths_html += (
-            f'<path d="{d}" fill="{color}" fill-opacity="0.75" stroke="none"/>\n'
+            if ref.repetition:
+                # Array reference: expand into one <use> per instance
+                for off in ref.repetition.offsets():
+                    t = _svg_transform(ox + off[0], oy + off[1], rot, mag, xrefl)
+                    parts.append(f'<use href="#{sub_id}" transform="{t}"/>')
+            else:
+                t = _svg_transform(ox, oy, rot, mag, xrefl)
+                parts.append(f'<use href="#{sub_id}" transform="{t}"/>')
+
+        symbols.append(
+            f'<symbol id="{_svg_id(cell.name)}" overflow="visible">{"".join(parts)}</symbol>'
         )
 
-    # preserveAspectRatio="none" — SVG fills container; viewBox manipulation
-    # keeps proportions because we always scale vw/vh by the same factor.
+    for cell in top_cells:
+        process(cell)
+
+    if not symbols:
+        return None, 0, 0, 1, 1
+
+    # ── Bounding box via gdstk (fast, uses C++ internally) ──
+    bbox = None
+    for cell in top_cells:
+        bb = cell.bounding_box()
+        if bb is None:
+            continue
+        (xmin, ymin), (xmax, ymax) = bb
+        if bbox is None:
+            bbox = [xmin, ymin, xmax, ymax]
+        else:
+            bbox[0] = min(bbox[0], xmin)
+            bbox[1] = min(bbox[1], ymin)
+            bbox[2] = max(bbox[2], xmax)
+            bbox[3] = max(bbox[3], ymax)
+
+    if bbox is None:
+        return None, 0, 0, 1, 1
+
+    xmin, ymin, xmax, ymax = bbox
+    pad  = max(xmax - xmin, ymax - ymin) * 0.02 or 1
+    vb_x = xmin - pad
+    vb_y = -(ymax + pad)          # SVG y = -GDS y after the global flip
+    vb_w = xmax - xmin + 2 * pad
+    vb_h = ymax - ymin + 2 * pad
+
+    top_uses = "".join(f'<use href="#{_svg_id(c.name)}"/>' for c in top_cells)
+    defs     = "<defs>" + "".join(symbols) + "</defs>"
+
     svg = (
         f'<svg id="gds" xmlns="http://www.w3.org/2000/svg" '
         f'viewBox="{vb_x:.3f} {vb_y:.3f} {vb_w:.3f} {vb_h:.3f}" '
         f'preserveAspectRatio="none" '
         f'style="width:100%;height:100%;display:block">'
-        f'{paths_html}</svg>'
+        f'{defs}'
+        f'<g transform="scale(1,-1)">{top_uses}</g>'
+        f'</svg>'
     )
     return svg, vb_x, vb_y, vb_w, vb_h
 
