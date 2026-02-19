@@ -10,20 +10,14 @@ _LAYER_COLORS = [
 ]
 
 def _unit_label(lib_unit):
-    """Return a human-readable unit string from the GDS user unit (in metres)."""
-    if abs(lib_unit - 1e-6) < 1e-9:
-        return "µm"
-    if abs(lib_unit - 1e-9) < 1e-12:
-        return "nm"
-    if abs(lib_unit - 1e-3) < 1e-6:
-        return "mm"
+    if abs(lib_unit - 1e-6) < 1e-9:  return "µm"
+    if abs(lib_unit - 1e-9) < 1e-12: return "nm"
+    if abs(lib_unit - 1e-3) < 1e-6:  return "mm"
     return "u"
 
 def _build_svg(top_cells):
-    """Flatten all polygons into one SVG <path> per layer.
-    Returns (svg_string, vb_x, vb_y, vb_w, vb_h).
-    Coordinates use :.3f (no scientific notation, 1nm precision for µm-unit GDS).
-    """
+    """Returns (svg_str, vb_x, vb_y, vb_w, vb_h).
+    Uses :.3f coordinates — no scientific notation, crisp rendering."""
     layer_paths = defaultdict(list)
     all_x, all_y = [], []
 
@@ -40,7 +34,7 @@ def _build_svg(top_cells):
             layer_paths[poly.layer].append(f"M{coords}Z")
 
     if not all_x:
-        return None, 1
+        return None, 0, 0, 1, 1
 
     min_x, max_x = min(all_x), max(all_x)
     min_y, max_y = min(all_y), max(all_y)
@@ -58,13 +52,16 @@ def _build_svg(top_cells):
             f'<path d="{d}" fill="{color}" fill-opacity="0.75" stroke="none"/>\n'
         )
 
+    # preserveAspectRatio="none" — SVG fills container; viewBox manipulation
+    # keeps proportions because we always scale vw/vh by the same factor.
     svg = (
-        f'<svg xmlns="http://www.w3.org/2000/svg" '
+        f'<svg id="gds" xmlns="http://www.w3.org/2000/svg" '
         f'viewBox="{vb_x:.3f} {vb_y:.3f} {vb_w:.3f} {vb_h:.3f}" '
+        f'preserveAspectRatio="none" '
         f'style="width:100%;height:100%;display:block">'
         f'{paths_html}</svg>'
     )
-    return svg, vb_w
+    return svg, vb_x, vb_y, vb_w, vb_h
 
 
 def show_interactive_viewer():
@@ -86,7 +83,7 @@ def show_interactive_viewer():
                     st.error("No top-level cell found in GDS file.")
                     return
 
-                svg, vb_w = _build_svg(top_cells)
+                svg, vb_x, vb_y, vb_w, vb_h = _build_svg(top_cells)
                 if not svg:
                     st.error("No geometry found in GDS file.")
                     return
@@ -97,8 +94,7 @@ def show_interactive_viewer():
 <html><head><style>
   *{{margin:0;padding:0;box-sizing:border-box}}
   body{{background:#1e1e2e;overflow:hidden;width:100%;height:600px}}
-  #c{{width:100%;height:600px;overflow:hidden;cursor:grab;position:relative}}
-  #w{{width:100%;height:100%;transform-origin:0 0;will-change:transform}}
+  #c{{width:100%;height:600px;overflow:hidden;cursor:grab;position:relative;background:#1e1e2e}}
   #ruler{{
     position:absolute;bottom:18px;left:18px;z-index:10;
     color:#e0e0e0;font:11px/1.4 monospace;pointer-events:none;
@@ -107,60 +103,80 @@ def show_interactive_viewer():
   #rlabel{{text-align:center;text-shadow:0 0 4px #000}}
 </style></head><body>
 <div id="c">
-  <div id="w">{svg}</div>
+  {svg}
   <div id="ruler"><div id="rbar"></div><div id="rlabel"></div></div>
 </div>
 <script>
-  const c=document.getElementById('c'),w=document.getElementById('w');
-  const VBW={vb_w:.6f}, UNIT="{unit}";
-  let s=1,ox=0,oy=0,panning=false,px,py;
+  const c  = document.getElementById('c');
+  const svg = document.getElementById('gds');
 
-  function niceNum(x){{
-    const mag=Math.pow(10,Math.floor(Math.log10(x)));
-    const f=x/mag;
-    if(f<1.5) return 1*mag;
-    if(f<3.5) return 2*mag;
-    if(f<7.5) return 5*mag;
+  // viewBox state in GDS coordinates
+  let vx={vb_x:.6f}, vy={vb_y:.6f}, vw={vb_w:.6f}, vh={vb_h:.6f};
+  const UNIT = "{unit}";
+
+  function niceNum(x) {{
+    const mag = Math.pow(10, Math.floor(Math.log10(x)));
+    const f = x / mag;
+    if (f < 1.5) return 1*mag;
+    if (f < 3.5) return 2*mag;
+    if (f < 7.5) return 5*mag;
     return 10*mag;
   }}
 
-  function updateRuler(){{
-    const gdsPerPx=VBW/(c.offsetWidth*s);
-    const gdsLen=niceNum(gdsPerPx*120);
-    const barPx=gdsLen/gdsPerPx;
-    document.getElementById('rbar').style.width=barPx+'px';
-    // Format label: drop decimals if whole number
-    const label=Number.isInteger(gdsLen)?gdsLen:gdsLen.toPrecision(3);
-    document.getElementById('rlabel').textContent=label+' '+UNIT;
+  function updateRuler() {{
+    const gdsPerPx = vw / c.offsetWidth;
+    const gdsLen   = niceNum(gdsPerPx * 120);
+    const barPx    = gdsLen / gdsPerPx;
+    document.getElementById('rbar').style.width = barPx + 'px';
+    const label = (gdsLen % 1 === 0) ? gdsLen : gdsLen.toPrecision(3);
+    document.getElementById('rlabel').textContent = label + ' ' + UNIT;
   }}
 
-  function apply(){{
-    w.style.transform=`translate(${{ox}}px,${{oy}}px) scale(${{s}})`;
+  function apply() {{
+    svg.setAttribute('viewBox', `${{vx}} ${{vy}} ${{vw}} ${{vh}}`);
     updateRuler();
   }}
 
-  // Scroll wheel → zoom toward cursor
-  c.addEventListener('wheel',e=>{{
+  // Scroll → zoom toward cursor (viewBox shrinks/grows, no pixel scaling)
+  c.addEventListener('wheel', e => {{
     e.preventDefault();
-    const r=c.getBoundingClientRect(),mx=e.clientX-r.left,my=e.clientY-r.top;
-    const d=e.deltaY<0?1.15:1/1.15;
-    ox=mx-(mx-ox)*d; oy=my-(my-oy)*d; s*=d; apply();
-  }},{{passive:false}});
+    const r   = c.getBoundingClientRect();
+    const mx  = (e.clientX - r.left) / r.width;   // [0,1] in container
+    const my  = (e.clientY - r.top)  / r.height;
+    const d   = e.deltaY < 0 ? 1/1.15 : 1.15;     // <1 = zoom in
+    const nvw = vw * d, nvh = vh * d;
+    vx += mx * (vw - nvw);
+    vy += my * (vh - nvh);
+    vw = nvw; vh = nvh;
+    apply();
+  }}, {{passive: false}});
 
-  // Left OR middle mouse → pan
-  c.addEventListener('mousedown',e=>{{
-    if(e.button===0||e.button===1){{
-      panning=true; px=e.clientX-ox; py=e.clientY-oy;
-      c.style.cursor='grabbing'; e.preventDefault();
+  // Left OR middle mouse → pan (convert pixel delta to GDS units)
+  let panning=false, startX, startY, startVX, startVY;
+  c.addEventListener('mousedown', e => {{
+    if (e.button===0 || e.button===1) {{
+      panning=true;
+      startX=e.clientX; startY=e.clientY;
+      startVX=vx; startVY=vy;
+      c.style.cursor='grabbing';
+      e.preventDefault();
     }}
   }});
-  window.addEventListener('mousemove',e=>{{
-    if(panning){{ox=e.clientX-px; oy=e.clientY-py; apply();}}
+  window.addEventListener('mousemove', e => {{
+    if (panning) {{
+      const r = c.getBoundingClientRect();
+      vx = startVX - (e.clientX - startX) / r.width  * vw;
+      vy = startVY - (e.clientY - startY) / r.height * vh;
+      apply();
+    }}
   }});
-  window.addEventListener('mouseup',()=>{{panning=false;c.style.cursor='grab';}});
+  window.addEventListener('mouseup', () => {{ panning=false; c.style.cursor='grab'; }});
 
   // Double-click → reset
-  c.addEventListener('dblclick',()=>{{s=1;ox=0;oy=0;apply();}});
+  c.addEventListener('dblclick', () => {{
+    vx={vb_x:.6f}; vy={vb_y:.6f}; vw={vb_w:.6f}; vh={vb_h:.6f};
+    apply();
+  }});
 
   updateRuler();
 </script></body></html>"""
