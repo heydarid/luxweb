@@ -4,17 +4,29 @@ import xml.etree.ElementTree as ET
 from collections import defaultdict
 import streamlit.components.v1 as components
 
-_LAYER_COLORS = [
-    "#4e9af1", "#f14e4e", "#4ef18a", "#f1c44e", "#ae4ef1",
-    "#4ef1e8", "#f18a4e", "#8af14e", "#f14eae", "#e8f14e",
-    "#f14e8a", "#4e8af1",
+# (fill_color, stroke_color, hatch_pattern)
+_LAYER_STYLES = [
+    ("#3a7fd5", "#1a4080", "hlines"),
+    ("#d53a3a", "#801a1a", "diag45"),
+    ("#2db870", "#0a6030", "vlines"),
+    ("#d5a020", "#806000", "xcross"),
+    ("#9b3ad5", "#501080", "diag135"),
+    ("#20c5be", "#0a6560", "cross"),
+    ("#d5701a", "#803000", "dots"),
+    ("#70d51a", "#308000", "hlines"),
+    ("#d51a8a", "#800050", "diag45"),
+    ("#c5c020", "#706000", "vlines"),
+    ("#d51a55", "#800020", "xcross"),
+    ("#1a70d5", "#004080", "diag135"),
 ]
+
 
 def _unit_label(lib_unit):
     if abs(lib_unit - 1e-6) < 1e-9:  return "µm"
     if abs(lib_unit - 1e-9) < 1e-12: return "nm"
     if abs(lib_unit - 1e-3) < 1e-6:  return "mm"
     return "u"
+
 
 def _parse_lyp(lyp_bytes):
     """Parse a KLayout .lyp XML file.
@@ -40,10 +52,61 @@ def _parse_lyp(lyp_bytes):
         pass
     return layer_colors
 
+
+def _make_pattern_svg(pid, ps, fill_color, stroke_color, ptype):
+    """Return an SVG <pattern> element string with a hatch overlay."""
+    h = ps / 2
+    sw = ps * 0.12
+    bg = (f'<rect width="{ps:.4f}" height="{ps:.4f}" '
+          f'fill="{fill_color}" fill-opacity="0.55"/>')
+    inner = {
+        'hlines': (
+            f'<line x1="0" y1="{h:.4f}" x2="{ps:.4f}" y2="{h:.4f}" '
+            f'stroke="{stroke_color}" stroke-width="{sw:.4f}" opacity="0.9"/>'
+        ),
+        'vlines': (
+            f'<line x1="{h:.4f}" y1="0" x2="{h:.4f}" y2="{ps:.4f}" '
+            f'stroke="{stroke_color}" stroke-width="{sw:.4f}" opacity="0.9"/>'
+        ),
+        'diag45': (
+            f'<line x1="0" y1="0" x2="{ps:.4f}" y2="{ps:.4f}" '
+            f'stroke="{stroke_color}" stroke-width="{sw:.4f}" opacity="0.9"/>'
+        ),
+        'diag135': (
+            f'<line x1="{ps:.4f}" y1="0" x2="0" y2="{ps:.4f}" '
+            f'stroke="{stroke_color}" stroke-width="{sw:.4f}" opacity="0.9"/>'
+        ),
+        'cross': (
+            f'<line x1="0" y1="{h:.4f}" x2="{ps:.4f}" y2="{h:.4f}" '
+            f'stroke="{stroke_color}" stroke-width="{sw:.4f}" opacity="0.9"/>'
+            f'<line x1="{h:.4f}" y1="0" x2="{h:.4f}" y2="{ps:.4f}" '
+            f'stroke="{stroke_color}" stroke-width="{sw:.4f}" opacity="0.9"/>'
+        ),
+        'xcross': (
+            f'<line x1="0" y1="0" x2="{ps:.4f}" y2="{ps:.4f}" '
+            f'stroke="{stroke_color}" stroke-width="{sw:.4f}" opacity="0.9"/>'
+            f'<line x1="{ps:.4f}" y1="0" x2="0" y2="{ps:.4f}" '
+            f'stroke="{stroke_color}" stroke-width="{sw:.4f}" opacity="0.9"/>'
+        ),
+        'dots': (
+            f'<circle cx="{h:.4f}" cy="{h:.4f}" r="{sw:.4f}" '
+            f'fill="{stroke_color}" opacity="0.9"/>'
+            f'<circle cx="0" cy="0" r="{sw*0.6:.4f}" fill="{stroke_color}" opacity="0.9"/>'
+            f'<circle cx="{ps:.4f}" cy="0" r="{sw*0.6:.4f}" fill="{stroke_color}" opacity="0.9"/>'
+            f'<circle cx="0" cy="{ps:.4f}" r="{sw*0.6:.4f}" fill="{stroke_color}" opacity="0.9"/>'
+            f'<circle cx="{ps:.4f}" cy="{ps:.4f}" r="{sw*0.6:.4f}" fill="{stroke_color}" opacity="0.9"/>'
+        ),
+    }.get(ptype, '')
+    return (
+        f'<pattern id="{pid}" patternUnits="userSpaceOnUse" '
+        f'width="{ps:.4f}" height="{ps:.4f}">{bg}{inner}</pattern>'
+    )
+
+
 def _build_svg(top_cells, layer_colors=None):
     """Returns (svg_str, vb_x, vb_y, vb_w, vb_h).
     layer_colors: optional {layer_number: hex_color} from a .lyp file.
-    Falls back to _LAYER_COLORS palette for unmapped layers."""
+    Falls back to _LAYER_STYLES palette for unmapped layers."""
     layer_paths = defaultdict(list)
     all_x, all_y = [], []
 
@@ -70,30 +133,75 @@ def _build_svg(top_cells, layer_colors=None):
     vb_w = max_x - min_x + 2 * pad
     vb_h = max_y - min_y + 2 * pad
 
+    ps = max(vb_w, vb_h) / 30   # hatch tile size: ~30 repeats across the view
+
+    defs_list = []
     paths_html = ""
     for i, layer in enumerate(sorted(layer_paths)):
-        if layer_colors and layer in layer_colors:
-            color = layer_colors[layer]
-        else:
-            color = _LAYER_COLORS[i % len(_LAYER_COLORS)]
+        style       = _LAYER_STYLES[i % len(_LAYER_STYLES)]
+        fill_color  = (layer_colors or {}).get(layer, style[0])
+        stroke_color = style[1]
+        ptype       = style[2]
+        pid         = f"lp{layer}"
+
+        defs_list.append(_make_pattern_svg(pid, ps, fill_color, stroke_color, ptype))
         d = " ".join(layer_paths[layer])
         paths_html += (
-            f'<path d="{d}" fill="{color}" fill-opacity="0.75" stroke="none"/>\n'
+            f'<path d="{d}" fill="url(#{pid})" '
+            f'stroke="{stroke_color}" stroke-width="{ps*0.025:.4f}" stroke-opacity="0.5"/>\n'
         )
 
-    # preserveAspectRatio="none" — SVG fills container; viewBox manipulation
-    # keeps proportions because we always scale vw/vh by the same factor.
+    defs_html = f'<defs>{"".join(defs_list)}</defs>' if defs_list else ""
     svg = (
         f'<svg id="gds" xmlns="http://www.w3.org/2000/svg" '
         f'viewBox="{vb_x:.3f} {vb_y:.3f} {vb_w:.3f} {vb_h:.3f}" '
         f'preserveAspectRatio="none" '
         f'style="width:100%;height:100%;display:block">'
-        f'{paths_html}</svg>'
+        f'{defs_html}{paths_html}</svg>'
     )
     return svg, vb_x, vb_y, vb_w, vb_h
 
 
 def show_interactive_viewer():
+    # ── Win98 styling for Streamlit file uploaders ────────────────────────────
+    st.markdown("""<style>
+[data-testid="stFileUploaderDropzone"]{
+  background:#d4d0c8!important;
+  border:1px solid!important;
+  border-color:#404040 #dfdfdf #dfdfdf #404040!important;
+  border-radius:0!important;
+  padding:6px 10px!important;
+}
+[data-testid="stFileUploaderDropzone"] button{
+  background:#d4d0c8!important;
+  color:#000!important;
+  font:11px "MS Sans Serif",Arial,sans-serif!important;
+  border-top:2px solid #dfdfdf!important;
+  border-left:2px solid #dfdfdf!important;
+  border-bottom:2px solid #404040!important;
+  border-right:2px solid #404040!important;
+  outline:1px solid #000!important;
+  border-radius:0!important;
+  box-shadow:none!important;
+  padding:3px 12px!important;
+}
+[data-testid="stFileUploaderDropzone"] button:hover{
+  background:#d4d0c8!important;color:#000!important;
+}
+[data-testid="stFileUploaderDropzone"] button:active{
+  border-top:2px solid #404040!important;
+  border-left:2px solid #404040!important;
+  border-bottom:2px solid #dfdfdf!important;
+  border-right:2px solid #dfdfdf!important;
+  padding:4px 11px 2px 13px!important;
+}
+[data-testid="stFileUploaderDropzone"] small,
+[data-testid="stFileUploaderDropzone"] span{
+  font-family:"MS Sans Serif",Arial,sans-serif!important;
+  font-size:10px!important;color:#000!important;
+}
+</style>""", unsafe_allow_html=True)
+
     st.header("🔗 KLayout-Powered Interactive Viewer")
     col1, col2 = st.columns([3, 2])
     with col1:
@@ -116,7 +224,9 @@ def show_interactive_viewer():
                     st.error("No top-level cell found in GDS file.")
                     return
 
-                svg, vb_x, vb_y, vb_w, vb_h = _build_svg(top_cells)
+                layer_colors = _parse_lyp(uploaded_lyp.read()) if uploaded_lyp else None
+
+                svg, vb_x, vb_y, vb_w, vb_h = _build_svg(top_cells, layer_colors)
                 if not svg:
                     st.error("No geometry found in GDS file.")
                     return
