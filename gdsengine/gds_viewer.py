@@ -1,5 +1,6 @@
 import streamlit as st
 import os
+from collections import defaultdict
 
 def show_interactive_viewer():
     st.header("🔗 KLayout-Powered Interactive Viewer")
@@ -21,21 +22,27 @@ def show_interactive_viewer():
                     st.error("No top-level cell found in GDS file.")
                     return
 
-                fig = go.Figure()
+                # Group all polygons by layer into one trace per layer.
+                # None separators break the path between polygons without
+                # connecting them, keeping fill="toself" correct per shape.
+                layer_xs = defaultdict(list)
+                layer_ys = defaultdict(list)
                 for cell in top_cells:
                     for polygon in cell.get_polygons():
                         pts = polygon.points
-                        xs = list(pts[:, 0]) + [pts[0, 0]]
-                        ys = list(pts[:, 1]) + [pts[0, 1]]
-                        layer = polygon.layer
-                        fig.add_trace(go.Scatter(
-                            x=xs, y=ys,
-                            fill="toself",
-                            mode="lines",
-                            name=f"Layer {layer}",
-                            legendgroup=f"layer_{layer}",
-                            showlegend=True,
-                        ))
+                        layer_xs[polygon.layer] += list(pts[:, 0]) + [pts[0, 0], None]
+                        layer_ys[polygon.layer] += list(pts[:, 1]) + [pts[0, 1], None]
+
+                fig = go.Figure()
+                for layer in sorted(layer_xs):
+                    fig.add_trace(go.Scatter(
+                        x=layer_xs[layer], y=layer_ys[layer],
+                        fill="toself",
+                        mode="lines",
+                        name=f"Layer {layer}",
+                        legendgroup=f"layer_{layer}",
+                        showlegend=True,
+                    ))
 
                 fig.update_layout(
                     yaxis=dict(scaleanchor="x", scaleratio=1),
