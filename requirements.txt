@@ -1,6 +1,8 @@
 streamlit
-langchain
-langchain-community
+langchain==1.0.5  
+langchain-community==0.4.1  
+langchain-text-splitters==1.0.0  
+langchain-google-vertexai==3.0.3  
 langchain-groq
 langchain-pinecone
 langchain-huggingface

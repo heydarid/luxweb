@@ -2,7 +2,7 @@ import streamlit as st
 import os
 from langchain_groq import ChatGroq
 from langchain_pinecone import PineconeVectorStore, PineconeEmbeddings
-from langchain.chains import create_retrieval_chain
+from langchain_classic.chains import create_retrieval_chain
 from langchain.chains.combine_documents import create_stuff_documents_chain
 from langchain_core.prompts import ChatPromptTemplate
 
@@ -16,8 +16,8 @@ st.set_page_config(page_title="LuxAgent Photonics", page_icon="💡")
 st.title("💡 LuxAgent: Silicon Photonics Expert")
 st.markdown("Querying your private cloud-hosted knowledge base.")
 
-# 3. Initialize the Brain (Gemma 3 on Groq)
-llm = ChatGroq(model_name="gemma3-70b-it", temperature=0)
+# Highly recommended for RAG and technical analysis
+llm = ChatGroq(model_name="llama-3.3-70b-versatile", temperature=0)
 
 # 4. Initialize the Memory (Pinecone)
 embeddings = PineconeEmbeddings(model="llama-text-embed-v2")
