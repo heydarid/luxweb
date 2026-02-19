@@ -11,6 +11,35 @@ _LAYER_COLORS = [
     "#f14e8a", "#4e8af1",
 ]
 
+# Hatch angles per layer index (0–11); cycles so each layer looks distinct
+_HATCH_ANGLES = [0, 45, 90, 135, 22, 67, 112, 157, 0, 45, 90, 135]
+# Relative line-width within each pattern cell (thicker for even rows)
+_HATCH_LW = [0.30, 0.30, 0.30, 0.30, 0.30, 0.30, 0.30, 0.30, 0.18, 0.18, 0.18, 0.18]
+
+
+def _hatch_pattern(pat_id, color, ps, idx):
+    """Return an SVG <pattern> element with hatching for one layer.
+
+    pat_id  – unique pattern id string
+    color   – hex fill/stroke color
+    ps      – pattern cell size in GDS coordinate units
+    idx     – layer index (0–11) selects hatch angle and line weight
+    """
+    angle = _HATCH_ANGLES[idx % 12]
+    lw    = ps * _HATCH_LW[idx % 12]
+    h     = ps / 2
+    rot   = f' patternTransform="rotate({angle})"' if angle else ''
+    return (
+        f'<pattern id="{pat_id}" x="0" y="0"'
+        f' width="{ps:.6g}" height="{ps:.6g}"'
+        f' patternUnits="userSpaceOnUse"{rot}>'
+        f'<rect width="{ps:.6g}" height="{ps:.6g}"'
+        f' fill="{color}" fill-opacity="0.25"/>'
+        f'<line x1="0" y1="{h:.6g}" x2="{ps:.6g}" y2="{h:.6g}"'
+        f' stroke="{color}" stroke-width="{lw:.6g}" stroke-opacity="0.9"/>'
+        f'</pattern>'
+    )
+
 def _unit_label(lib_unit):
     if abs(lib_unit - 1e-6) < 1e-9:  return "µm"
     if abs(lib_unit - 1e-9) < 1e-12: return "nm"
@@ -73,6 +102,7 @@ def _build_svg(top_cells, layer_colors=None):
 
     visited = set()
     symbols = []   # built depth-first so every symbol is defined before use
+    all_layers = set()  # every layer number seen in any polygon
 
     def process(cell):
         if cell.name in visited:
@@ -92,12 +122,13 @@ def _build_svg(top_cells, layer_colors=None):
                 continue
             coords = " L".join(f"{x:.3f},{y:.3f}" for x, y in zip(pts[:, 0], pts[:, 1]))
             lpaths[poly.layer].append(f"M{coords}Z")
+            all_layers.add(poly.layer)
 
         parts = []
         for layer in sorted(lpaths):
             d = " ".join(lpaths[layer])
             parts.append(
-                f'<path d="{d}" fill="{color_for(layer)}" fill-opacity="0.75" stroke="none"/>'
+                f'<path d="{d}" fill="url(#pat_L{layer})" stroke="none"/>'
             )
 
         # ── References → <use> elements ──
