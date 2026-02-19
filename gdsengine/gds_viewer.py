@@ -114,6 +114,19 @@ def show_interactive_viewer():
   let vx={vb_x:.6f}, vy={vb_y:.6f}, vw={vb_w:.6f}, vh={vb_h:.6f};
   const UNIT = "{unit}";
 
+  // Expand the initial viewBox on the shorter dimension so the GDS content
+  // fills the container pixel-for-pixel without distortion.
+  // (preserveAspectRatio="none" + matching aspect ratio = no stretch, no letterbox)
+  (function() {{
+    const cw = c.offsetWidth || 800, ch = c.offsetHeight || 600;
+    const cAR = cw / ch, gAR = vw / vh;
+    if (gAR > cAR) {{                      // layout wider → expand vh
+      const nvh = vw / cAR; vy -= (nvh - vh) / 2; vh = nvh;
+    }} else {{                              // layout taller → expand vw
+      const nvw = vh * cAR; vx -= (nvw - vw) / 2; vw = nvw;
+    }}
+  }})();
+
   function niceNum(x) {{
     const mag = Math.pow(10, Math.floor(Math.log10(x)));
     const f = x / mag;
@@ -172,9 +185,10 @@ def show_interactive_viewer():
   }});
   window.addEventListener('mouseup', () => {{ panning=false; c.style.cursor='grab'; }});
 
-  // Double-click → reset
+  // Double-click → reset to the aspect-corrected initial view
+  const initVx=vx, initVy=vy, initVw=vw, initVh=vh;
   c.addEventListener('dblclick', () => {{
-    vx={vb_x:.6f}; vy={vb_y:.6f}; vw={vb_w:.6f}; vh={vb_h:.6f};
+    vx=initVx; vy=initVy; vw=initVw; vh=initVh;
     apply();
   }});
 
