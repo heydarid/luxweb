@@ -93,96 +93,187 @@ def show_interactive_viewer():
                 html = f"""<!DOCTYPE html>
 <html><head><style>
   *{{margin:0;padding:0;box-sizing:border-box}}
-  body{{background:#1e1e2e;overflow:hidden;width:100%;height:600px}}
-  #c{{width:100%;height:600px;overflow:hidden;cursor:grab;position:relative;background:#1e1e2e}}
+  body{{background:#d4d0c8;overflow:hidden;font-family:"MS Sans Serif",Arial,sans-serif;font-size:11px}}
+
+  /* ── Windows 98 toolbar ── */
+  #toolbar{{
+    background:#d4d0c8;
+    border-bottom:1px solid #808080;
+    padding:4px 6px;
+    display:flex;gap:4px;align-items:center;
+    user-select:none;
+  }}
+  .btn{{
+    background:#d4d0c8;color:#000;
+    font:11px "MS Sans Serif",Arial,sans-serif;
+    padding:3px 10px;cursor:pointer;
+    border-top:2px solid #dfdfdf;border-left:2px solid #dfdfdf;
+    border-bottom:2px solid #404040;border-right:2px solid #404040;
+    outline:1px solid #000;
+    white-space:nowrap;min-width:72px;text-align:center;
+  }}
+  .btn:active,.btn.on{{
+    border-top:2px solid #404040;border-left:2px solid #404040;
+    border-bottom:2px solid #dfdfdf;border-right:2px solid #dfdfdf;
+    padding:4px 9px 2px 11px;
+  }}
+  .btn:focus{{outline:1px dotted #000;outline-offset:-4px}}
+  .sep{{width:1px;height:20px;background:#808080;border-right:1px solid #fff;margin:0 2px}}
+
+  /* ── Viewer canvas ── */
+  #c{{
+    width:100%;height:600px;overflow:hidden;
+    cursor:crosshair;position:relative;background:#1e1e2e;
+  }}
+
+  /* ── Box-zoom selection rectangle ── */
+  #selbox{{
+    position:absolute;display:none;pointer-events:none;
+    border:1px dashed #fff;background:rgba(100,160,255,.12);
+  }}
+
+  /* ── Ruler ── */
   #ruler{{
-    position:absolute;bottom:18px;left:18px;z-index:10;
+    position:absolute;bottom:16px;left:16px;z-index:10;
     color:#e0e0e0;font:11px/1.4 monospace;pointer-events:none;
   }}
   #rbar{{height:3px;background:#e0e0e0;border-radius:1px;margin-bottom:4px}}
   #rlabel{{text-align:center;text-shadow:0 0 4px #000}}
 </style></head><body>
+
+<div id="toolbar">
+  <button class="btn on" id="bPan"  title="Pan – drag to move">&#128336; Pan</button>
+  <button class="btn"    id="bBox"  title="Box Zoom – drag to select area">&#9974; Box Zoom</button>
+  <div class="sep"></div>
+  <button class="btn"    id="bReset" title="Fit whole layout (double-click also works)">&#8635; Reset</button>
+</div>
+
 <div id="c">
   {svg}
+  <div id="selbox"></div>
   <div id="ruler"><div id="rbar"></div><div id="rlabel"></div></div>
 </div>
-<script>
-  const c  = document.getElementById('c');
-  const svg = document.getElementById('gds');
 
-  // viewBox state in GDS coordinates
+<script>
+  const c   = document.getElementById('c');
+  const gds = document.getElementById('gds');
+  const sel = document.getElementById('selbox');
+
+  let mode = 'pan';   // 'pan' | 'zoombox'
   let vx={vb_x:.6f}, vy={vb_y:.6f}, vw={vb_w:.6f}, vh={vb_h:.6f};
   const UNIT = "{unit}";
 
-  function niceNum(x) {{
-    const mag = Math.pow(10, Math.floor(Math.log10(x)));
-    const f = x / mag;
-    if (f < 1.5) return 1*mag;
-    if (f < 3.5) return 2*mag;
-    if (f < 7.5) return 5*mag;
-    return 10*mag;
-  }}
+  // ── Aspect-ratio correction on init ──────────────────────────────────────
+  (function(){{
+    const cw=c.offsetWidth||800, ch=c.offsetHeight||600;
+    const cAR=cw/ch, gAR=vw/vh;
+    if(gAR>cAR){{ const n=vw/cAR; vy-=(n-vh)/2; vh=n; }}
+    else        {{ const n=vh*cAR; vx-=(n-vw)/2; vw=n; }}
+  }})();
+  const initVx=vx, initVy=vy, initVw=vw, initVh=vh;
 
-  function updateRuler() {{
-    const gdsPerPx = vw / c.offsetWidth;
-    const gdsLen   = niceNum(gdsPerPx * 120);
-    const barPx    = gdsLen / gdsPerPx;
-    document.getElementById('rbar').style.width = barPx + 'px';
-    const label = (gdsLen % 1 === 0) ? gdsLen : gdsLen.toPrecision(3);
-    document.getElementById('rlabel').textContent = label + ' ' + UNIT;
+  // ── Helpers ───────────────────────────────────────────────────────────────
+  function niceNum(x){{
+    const m=Math.pow(10,Math.floor(Math.log10(x))), f=x/m;
+    return f<1.5?m : f<3.5?2*m : f<7.5?5*m : 10*m;
   }}
-
-  function apply() {{
-    svg.setAttribute('viewBox', `${{vx}} ${{vy}} ${{vw}} ${{vh}}`);
+  function updateRuler(){{
+    const gpx=vw/c.offsetWidth, gl=niceNum(gpx*120), bp=gl/gpx;
+    document.getElementById('rbar').style.width=bp+'px';
+    document.getElementById('rlabel').textContent=(gl%1===0?gl:gl.toPrecision(3))+' '+UNIT;
+  }}
+  function apply(){{
+    gds.setAttribute('viewBox',`${{vx}} ${{vy}} ${{vw}} ${{vh}}`);
     updateRuler();
   }}
+  function setMode(m){{
+    mode=m;
+    ['bPan','bBox'].forEach(id=>document.getElementById(id).classList.remove('on'));
+    document.getElementById(m==='pan'?'bPan':'bBox').classList.add('on');
+    c.style.cursor = m==='pan' ? 'crosshair' : 'crosshair';
+  }}
 
-  // Scroll → zoom toward cursor (viewBox shrinks/grows, no pixel scaling)
-  c.addEventListener('wheel', e => {{
+  // ── Toolbar buttons ───────────────────────────────────────────────────────
+  document.getElementById('bPan').addEventListener('click',()=>setMode('pan'));
+  document.getElementById('bBox').addEventListener('click',()=>setMode('zoombox'));
+  document.getElementById('bReset').addEventListener('click',()=>{{
+    vx=initVx;vy=initVy;vw=initVw;vh=initVh;apply();
+  }});
+
+  // ── Scroll wheel → zoom toward cursor (works in both modes) ──────────────
+  c.addEventListener('wheel',e=>{{
     e.preventDefault();
-    const r   = c.getBoundingClientRect();
-    const mx  = (e.clientX - r.left) / r.width;   // [0,1] in container
-    const my  = (e.clientY - r.top)  / r.height;
-    const d   = e.deltaY < 0 ? 1/1.15 : 1.15;     // <1 = zoom in
-    const nvw = vw * d, nvh = vh * d;
-    vx += mx * (vw - nvw);
-    vy += my * (vh - nvh);
-    vw = nvw; vh = nvh;
+    const r=c.getBoundingClientRect();
+    const mx=(e.clientX-r.left)/r.width, my=(e.clientY-r.top)/r.height;
+    const d=e.deltaY<0?1/1.15:1.15;
+    const nvw=vw*d, nvh=vh*d;
+    vx+=mx*(vw-nvw); vy+=my*(vh-nvh); vw=nvw; vh=nvh;
     apply();
-  }}, {{passive: false}});
+  }},{{passive:false}});
 
-  // Left OR middle mouse → pan (convert pixel delta to GDS units)
-  let panning=false, startX, startY, startVX, startVY;
-  c.addEventListener('mousedown', e => {{
-    if (e.button===0 || e.button===1) {{
-      panning=true;
-      startX=e.clientX; startY=e.clientY;
-      startVX=vx; startVY=vy;
-      c.style.cursor='grabbing';
-      e.preventDefault();
+  // ── Mouse drag: pan or box-zoom ───────────────────────────────────────────
+  let dragging=false, sx, sy, svx, svy, bx0, by0;
+
+  c.addEventListener('mousedown',e=>{{
+    if(e.button!==0 && e.button!==1) return;
+    e.preventDefault();
+    dragging=true;
+    sx=e.clientX; sy=e.clientY; svx=vx; svy=vy;
+    const r=c.getBoundingClientRect();
+    bx0=e.clientX-r.left; by0=e.clientY-r.top;
+    if(mode==='zoombox'){{
+      sel.style.cssText=`left:${{bx0}}px;top:${{by0}}px;width:0;height:0;display:block`;
     }}
   }});
-  window.addEventListener('mousemove', e => {{
-    if (panning) {{
-      const r = c.getBoundingClientRect();
-      vx = startVX - (e.clientX - startX) / r.width  * vw;
-      vy = startVY - (e.clientY - startY) / r.height * vh;
+
+  window.addEventListener('mousemove',e=>{{
+    if(!dragging) return;
+    const r=c.getBoundingClientRect();
+    if(mode==='pan'){{
+      vx=svx-(e.clientX-sx)/r.width *vw;
+      vy=svy-(e.clientY-sy)/r.height*vh;
       apply();
+    }} else {{
+      const cx=Math.max(0,Math.min(r.width, e.clientX-r.left));
+      const cy=Math.max(0,Math.min(r.height,e.clientY-r.top));
+      sel.style.left  =Math.min(bx0,cx)+'px';
+      sel.style.top   =Math.min(by0,cy)+'px';
+      sel.style.width =Math.abs(cx-bx0)+'px';
+      sel.style.height=Math.abs(cy-by0)+'px';
     }}
   }});
-  window.addEventListener('mouseup', () => {{ panning=false; c.style.cursor='grab'; }});
 
-  // Double-click → reset
-  c.addEventListener('dblclick', () => {{
-    vx={vb_x:.6f}; vy={vb_y:.6f}; vw={vb_w:.6f}; vh={vb_h:.6f};
-    apply();
+  window.addEventListener('mouseup',e=>{{
+    if(!dragging) return;
+    dragging=false;
+    if(mode==='zoombox'){{
+      sel.style.display='none';
+      const r=c.getBoundingClientRect();
+      const cx=Math.max(0,Math.min(r.width, e.clientX-r.left));
+      const cy=Math.max(0,Math.min(r.height,e.clientY-r.top));
+      const pw=Math.abs(cx-bx0), ph=Math.abs(cy-by0);
+      if(pw>6 && ph>6){{
+        const x0=Math.min(bx0,cx)/r.width,  x1=Math.max(bx0,cx)/r.width;
+        const y0=Math.min(by0,cy)/r.height, y1=Math.max(by0,cy)/r.height;
+        let nvx=vx+x0*vw, nvy=vy+y0*vh, nvw=(x1-x0)*vw, nvh=(y1-y0)*vh;
+        // expand shorter side to match container aspect ratio
+        const cAR=r.width/r.height, sAR=nvw/nvh;
+        if(sAR>cAR){{ const n=nvw/cAR; nvy-=(n-nvh)/2; nvh=n; }}
+        else        {{ const n=nvh*cAR; nvx-=(n-nvw)/2; nvw=n; }}
+        vx=nvx;vy=nvy;vw=nvw;vh=nvh;
+        apply();
+      }}
+    }}
   }});
 
-  updateRuler();
+  // ── Double-click → reset ──────────────────────────────────────────────────
+  c.addEventListener('dblclick',()=>{{vx=initVx;vy=initVy;vw=initVw;vh=initVh;apply();}});
+
+  apply();
 </script></body></html>"""
 
-                components.html(html, height=620)
-                st.caption("Scroll to zoom · Drag or middle-click to pan · Double-click to reset")
+                components.html(html, height=645)
+                st.caption("Scroll to zoom · Drag to pan/box-zoom · Double-click to reset")
 
         except Exception as e:
             st.error(f"Viewer Error: {e}")
