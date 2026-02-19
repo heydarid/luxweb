@@ -14,3 +14,8 @@ pypdf
 # for the gds viewer
 gdstk
 plotly
+klayout
+pillow
+pandas
+kweb
+gdsfactory
