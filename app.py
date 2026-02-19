@@ -64,7 +64,7 @@ qa = create_retrieval_chain(
 )
 
 # 6. The UI
-user_query = st.text_input("Ask a technical question about your papers:")
+user_query = st.text_input("Ask a technical question about your papers:", key="user_chat_input")
 
 if user_query:
     with st.spinner("Analyzing papers..."):
