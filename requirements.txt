@@ -1,12 +1,10 @@
-langchain-huggingface>=0.0.3
-langchain-chroma>=0.1.0
-sentence-transformers>=3.0.0
-langchain>=0.2.0
-langchain-ollama>=0.1.0
-langchain-core>=0.2.0
-python-dotenv
 streamlit
+langchain
 langchain-community
 langchain-groq
 langchain-pinecone
+langchain-huggingface
+langchain-chroma
+sentence-transformers
+python-dotenv
 pypdf
