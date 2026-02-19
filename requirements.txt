@@ -15,4 +15,3 @@ pypdf
 klayout
 pillow
 gdstk
-plotly
