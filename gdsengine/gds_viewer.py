@@ -1,15 +1,11 @@
 import streamlit as st
-import streamlit.components.v1 as components
 import gdsfactory as gf
 import os
-
-# Get path to the .lyp file inside the same folder
-CURRENT_DIR = os.path.dirname(os.path.abspath(__file__))
-LYP_PATH = os.path.join(CURRENT_DIR, "EBeam.lyp")
+import streamlit.components.v1 as components
+from kweb.main import save_stack # This is the "magic" exporter
 
 def show_interactive_viewer():
     st.header("🔗 KLayout-Powered Interactive Viewer")
-    
     uploaded_file = st.file_uploader("Upload GDSII", type=["gds"], key="kweb_uploader")
     
     if uploaded_file:
@@ -20,38 +16,30 @@ def show_interactive_viewer():
             f.write(uploaded_file.getbuffer())
         
         try:
-            with st.spinner("KLayout engine rendering layout..."):
-                # 1. Import with GDSFactory
-                component = gf.import_gds(gds_path)
+            with st.spinner("KLayout engine rendering..."):
+                # 1. Load the GDS
+                c = gf.import_gds(gds_path)
                 
-                # 2. Generate the interactive HTML 
-                # In newer gdsfactory, we use plot(idx=...) or create a widget
-                # This is the most reliable way to get an HTML string for Streamlit
-                html_path = "layout_viewer.html"
+                # 2. Use kweb's internal exporter to create the HTML file
+                # This bypasses the 'plot' TypeError and goes straight to the source
+                save_stack(c, html_path)
                 
-                # This function generates a standalone HTML file using the kweb engine
-                # which is bundled with newer gdsfactory/klayout setups
-                component.plot(save_html=html_path) 
-                
-                # 3. Read and inject into Streamlit
+                # 3. Read and display
                 if os.path.exists(html_path):
-                    with open(html_path, 'r', encoding='utf-8') as f:
+                    with open(html_path, "r", encoding="utf-8") as f:
                         html_content = f.read()
                     
+                    # Increase height to 700 for better visibility
                     components.html(html_content, height=700, scrolling=False)
                     st.success("Interactive viewer loaded!")
                 else:
-                    # Fallback if the HTML wasn't created
-                    st.error("Failed to generate viewer file.")
-
-        except AttributeError:
-            # If .plot(save_html=...) also fails due to versioning, 
-            # use this 'manual' kweb call:
-            from kweb.main import get_app
-            st.warning("Switching to kweb backup viewer...")
-            # (Simplified fallback logic here if needed)
+                    st.error("Failed to generate HTML layout.")
+                    
+        except Exception as e:
+            st.error(f"Viewer Error: {e}")
+            st.info("Try checking if 'kweb' and 'gdsfactory' versions are compatible.")
         finally:
-            # Clean up to keep the server lightweight
+            # Clean up files so they don't sit on the Streamlit server
             for p in [gds_path, html_path]:
                 if os.path.exists(p):
                     os.remove(p)
