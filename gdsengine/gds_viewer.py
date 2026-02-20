@@ -5,20 +5,25 @@ import xml.etree.ElementTree as ET
 from collections import defaultdict
 import streamlit.components.v1 as components
 
-# (fill_color, stroke_color, hatch_pattern)
+# KLayout-style layer defaults: (fill_color, frame_color, stipple_index)
+# Stipple indices reference built-in KLayout patterns defined in JS.
 _LAYER_STYLES = [
-    ("#3a7fd5", "#1a4080", "hlines"),
-    ("#d53a3a", "#801a1a", "diag45"),
-    ("#2db870", "#0a6030", "vlines"),
-    ("#d5a020", "#806000", "xcross"),
-    ("#9b3ad5", "#501080", "diag135"),
-    ("#20c5be", "#0a6560", "cross"),
-    ("#d5701a", "#803000", "dots"),
-    ("#70d51a", "#308000", "hlines"),
-    ("#d51a8a", "#800050", "diag45"),
-    ("#c5c020", "#706000", "vlines"),
-    ("#d51a55", "#800020", "xcross"),
-    ("#1a70d5", "#004080", "diag135"),
+    ("#ff0000", "#ff0000",  2),   # dotted
+    ("#00ff00", "#00ff00",  4),   # left-hatched
+    ("#0000ff", "#0000ff",  5),   # lightly left-hatched
+    ("#ffff00", "#ffff00",  8),   # right-hatched
+    ("#ff00ff", "#ff00ff",  9),   # lightly right-hatched
+    ("#00ffff", "#00ffff", 12),   # cross-hatched
+    ("#ff8000", "#ff8000",  3),   # coarsely dotted
+    ("#80ff00", "#80ff00",  6),   # strongly left-hatched dense
+    ("#0080ff", "#0080ff", 10),   # strongly right-hatched dense
+    ("#ff0080", "#ff0080", 13),   # lightly cross-hatched
+    ("#80ff80", "#80ff80", 14),   # checkerboard 2px
+    ("#8080ff", "#8080ff", 23),   # 22.5 degree down
+    ("#ff8080", "#ff8080", 33),   # vertical
+    ("#80ffff", "#80ffff", 38),   # horizontal
+    ("#ffff80", "#ffff80", 28),   # zig zag
+    ("#ff80ff", "#ff80ff", 29),   # sine
 ]
 
 
@@ -31,38 +36,41 @@ def _unit_label(lib_unit):
 
 def _parse_lyp(lyp_bytes):
     """Parse a KLayout .lyp file.
-    Returns ({layer: hex_color}, {layer: name}) for visible layers."""
-    layer_colors = {}
+    Returns ({layer: hex_color}, {layer: frame_color}, {layer: name})."""
+    layer_fills  = {}
+    layer_frames = {}
     layer_names  = {}
     try:
         root = ET.fromstring(lyp_bytes)
         for props in root.findall(".//properties"):
             if props.findtext("visible", "true").strip().lower() == "false":
                 continue
-            source = props.findtext("source", "").strip()
-            color  = props.findtext("fill-color", "").strip()
-            name   = props.findtext("name",       "").strip()
-            if not source or not color:
+            source      = props.findtext("source",      "").strip()
+            fill_color  = props.findtext("fill-color",  "").strip()
+            frame_color = props.findtext("frame-color", "").strip()
+            name        = props.findtext("name",        "").strip()
+            if not source or not fill_color:
                 continue
             try:
                 layer = int(source.split("/")[0])
-                layer_colors[layer] = color
+                layer_fills[layer]  = fill_color
+                layer_frames[layer] = frame_color or fill_color
                 if name:
                     layer_names[layer] = name
             except (ValueError, IndexError):
                 continue
     except ET.ParseError:
         pass
-    return layer_colors, layer_names
+    return layer_fills, layer_frames, layer_names
 
 
-def _build_cell_data(cell, layer_colors=None, layer_names=None):
-    """Build canvas render data for a single gdstk Cell (polygons flattened).
+def _build_cell_data(cell, layer_fills=None, layer_frames=None, layer_names=None):
+    """Build canvas render data for one gdstk Cell.
 
     Returns (layers_list, vb_x, vb_y, vb_w, vb_h) or (None, 0,0,1,1).
 
-    Each entry in layers_list:
-        [layer_num, display_name, fill, stroke, ptype, polys, bounds]
+    Each entry:
+        [layer_num, name, fill_color, frame_color, stipple_idx, polys, bounds]
     """
     layer_polys = defaultdict(list)
     all_x, all_y = [], []
@@ -98,11 +106,11 @@ def _build_cell_data(cell, layer_colors=None, layer_names=None):
 
     layers_list = []
     for i, layer_num in enumerate(sorted(layer_polys)):
-        style        = _LAYER_STYLES[i % len(_LAYER_STYLES)]
-        fill_color   = (layer_colors or {}).get(layer_num, style[0])
-        stroke_color = style[1]
-        ptype        = style[2]
-        lname        = (layer_names or {}).get(layer_num, f"Layer {layer_num}")
+        style      = _LAYER_STYLES[i % len(_LAYER_STYLES)]
+        fill_c     = (layer_fills  or {}).get(layer_num, style[0])
+        frame_c    = (layer_frames or {}).get(layer_num, style[1])
+        stip_idx   = style[2]
+        lname      = (layer_names  or {}).get(layer_num, f"{layer_num}/0")
 
         polys  = []
         bounds = []
@@ -111,14 +119,13 @@ def _build_cell_data(cell, layer_colors=None, layer_names=None):
             bounds.append([round(bx0,2), round(by0,2),
                            round(bx1,2), round(by1,2)])
 
-        layers_list.append([layer_num, lname, fill_color,
-                            stroke_color, ptype, polys, bounds])
+        layers_list.append([layer_num, lname, fill_c,
+                            frame_c, stip_idx, polys, bounds])
 
     return layers_list, vb_x, vb_y, vb_w, vb_h
 
 
 def show_interactive_viewer():
-    # ── Win98 styling for Streamlit file uploaders ────────────────────────────
     st.markdown("""<style>
 [data-testid="stFileUploaderDropzone"]{
   background:#d4d0c8!important;border:1px solid!important;
@@ -167,10 +174,10 @@ def show_interactive_viewer():
                     st.error("No top-level cell found in GDS file.")
                     return
 
-                layer_colors, layer_names = (
-                    _parse_lyp(uploaded_lyp.read()) if uploaded_lyp else ({}, {}))
+                layer_fills, layer_frames, layer_names = (
+                    _parse_lyp(uploaded_lyp.read()) if uploaded_lyp
+                    else ({}, {}, {}))
 
-                # ── collect all library cells ──────────────────────────────
                 top_names = [c.name for c in top_cells]
                 try:
                     all_lib_cells = list(lib.cells)
@@ -182,7 +189,6 @@ def show_interactive_viewer():
                     key=lambda c: c.name)
                 ordered_cells = list(top_cells) + non_top
 
-                # ── cell hierarchy (parent → [child names]) ───────────────
                 cell_children: dict = {}
                 for cell in ordered_cells:
                     children = []
@@ -195,11 +201,10 @@ def show_interactive_viewer():
                             pass
                     cell_children[cell.name] = children
 
-                # ── per-cell render data ──────────────────────────────────
                 all_cells_data: dict = {}
                 for cell in ordered_cells:
                     layers_list, vb_x, vb_y, vb_w, vb_h = _build_cell_data(
-                        cell, layer_colors, layer_names)
+                        cell, layer_fills, layer_frames, layer_names)
                     if layers_list is not None:
                         all_cells_data[cell.name] = {
                             "b": [vb_x, vb_y, vb_w, vb_h],
@@ -215,22 +220,19 @@ def show_interactive_viewer():
                     next(iter(all_cells_data)))
 
                 unit             = _unit_label(lib.unit)
-                all_cells_json   = json.dumps(all_cells_data,  separators=(',', ':'))
-                top_names_json   = json.dumps(top_names,        separators=(',', ':'))
-                cell_tree_json   = json.dumps(cell_children,    separators=(',', ':'))
+                all_cells_json   = json.dumps(all_cells_data, separators=(',',':'))
+                top_names_json   = json.dumps(top_names,      separators=(',',':'))
+                cell_tree_json   = json.dumps(cell_children,  separators=(',',':'))
                 init_cell_json   = json.dumps(init_cell)
 
                 html = f"""<!DOCTYPE html>
 <html><head><meta charset="utf-8"><style>
-/* ── reset ── */
 *{{margin:0;padding:0;box-sizing:border-box}}
-html,body{{height:100%;overflow:hidden;background:#d4d0c8;
+html,body{{height:100%;overflow:hidden;background:#000;
   font-family:"MS Sans Serif",Arial,sans-serif;font-size:11px;color:#000}}
 
-/* ── shell ── */
 #shell{{display:flex;flex-direction:column;height:100%;}}
 
-/* ── Win98 toolbar ── */
 #toolbar{{
   background:#d4d0c8;border-bottom:2px solid #808080;
   padding:3px 5px;display:flex;gap:3px;align-items:center;
@@ -253,25 +255,21 @@ html,body{{height:100%;overflow:hidden;background:#d4d0c8;
 .sep{{width:1px;height:18px;background:#808080;border-right:1px solid #fff;margin:0 2px;flex-shrink:0}}
 #zoomLbl{{font:11px "MS Sans Serif",Arial,sans-serif;color:#000;padding:0 4px;min-width:48px}}
 
-/* ── body row ── */
 #body{{display:flex;flex:1;overflow:hidden;min-height:0}}
 
-/* ── canvas wrapper ── */
 #wrap{{
   position:relative;flex:1;min-width:0;
-  background:#1a1a2e;overflow:hidden;cursor:crosshair;
+  background:#000;overflow:hidden;cursor:crosshair;
 }}
 canvas{{display:block;}}
 #selbox{{position:absolute;display:none;pointer-events:none;
   border:1px dashed #7af;background:rgba(80,140,255,.10);}}
 
-/* ── ruler overlay ── */
 #ruler{{position:absolute;bottom:28px;left:12px;z-index:10;
-  color:#ccc;font:10px/1.4 monospace;pointer-events:none;}}
-#rbar{{height:2px;background:#ccc;border-radius:1px;margin-bottom:3px}}
+  color:#bbb;font:10px/1.4 monospace;pointer-events:none;}}
+#rbar{{height:2px;background:#bbb;border-radius:1px;margin-bottom:3px}}
 #rlabel{{text-align:center;text-shadow:0 0 3px #000}}
 
-/* ── status bar ── */
 #status{{
   height:18px;background:#d4d0c8;
   border-top:1px solid #808080;padding:2px 6px;
@@ -282,14 +280,11 @@ canvas{{display:block;}}
 #cellName{{color:#000080;font-weight:bold;overflow:hidden;
   text-overflow:ellipsis;white-space:nowrap;max-width:240px}}
 
-/* ── Win98 sidebar ── */
 #sidebar{{
   width:195px;min-width:195px;background:#d4d0c8;
   border-left:2px solid #808080;
   display:flex;flex-direction:column;overflow:hidden;
 }}
-
-/* Win98 group-box panels */
 .gb{{
   margin:4px 4px 0 4px;flex-shrink:0;
   border-top:1px solid #808080;border-left:1px solid #808080;
@@ -303,7 +298,6 @@ canvas{{display:block;}}
   display:flex;align-items:center;gap:3px;
 }}
 
-/* ── cell tree ── */
 #cellScroll{{overflow-y:auto;flex:1;padding:1px 0}}
 .tnode{{display:flex;align-items:center;padding:1px 2px 1px 4px;cursor:pointer;white-space:nowrap}}
 .tnode:hover{{background:#b8c8e0}}
@@ -315,7 +309,6 @@ canvas{{display:block;}}
 .tn-lbl.toplevel{{font-weight:bold}}
 .tn-children{{display:none;}}
 
-/* ── layer panel ── */
 .lyr-ctrl{{display:flex;gap:2px;padding:2px 3px;border-bottom:1px solid #b0b0b0}}
 .sbtn{{
   background:#d4d0c8;color:#000;font:10px "MS Sans Serif",Arial,sans-serif;
@@ -337,79 +330,195 @@ canvas{{display:block;}}
 .lr-lnum{{font:9px monospace;color:#606060;flex-shrink:0}}
 </style></head><body><div id="shell">
 
-<!-- toolbar -->
 <div id="toolbar">
   <button class="btn on" id="bPan"  title="Pan (drag)">&#9995; Pan</button>
   <button class="btn"    id="bBox"  title="Box Zoom (drag rectangle)">&#9974; Zoom</button>
   <div class="sep"></div>
   <button class="btn"    id="bGrid" title="Toggle grid overlay">&#10166; Grid</button>
-  <button class="btn"    id="bReset" title="Fit entire layout (double-click also works)">&#8635; Fit</button>
+  <button class="btn"    id="bReset" title="Fit (double-click also works)">&#8635; Fit</button>
   <div class="sep"></div>
   <span id="zoomLbl" title="Current zoom level">100%</span>
 </div>
 
-<!-- body: canvas + sidebar -->
 <div id="body">
-
-  <!-- canvas -->
   <div id="wrap">
     <canvas id="cv"></canvas>
     <div id="selbox"></div>
     <div id="ruler"><div id="rbar"></div><div id="rlabel"></div></div>
   </div>
-
-  <!-- sidebar -->
   <div id="sidebar">
-
-    <!-- Cells group-box -->
     <div class="gb" style="flex:0 0 auto;max-height:42%">
       <div class="gb-title">&#128194; Cells</div>
       <div id="cellScroll"></div>
     </div>
-
-    <!-- Layers group-box -->
     <div class="gb grow">
-      <div class="gb-title">
-        &#9632; Layers
-      </div>
+      <div class="gb-title">&#9632; Layers</div>
       <div class="lyr-ctrl">
         <button class="sbtn" id="bShowAll">Show All</button>
         <button class="sbtn" id="bHideAll">Hide All</button>
       </div>
       <div id="layerScroll"></div>
     </div>
-
-  </div><!-- sidebar -->
-
-</div><!-- body -->
-
-<!-- status bar -->
-<div id="status">
-  <span id="cellName">—</span>
-  <span id="coords">x: —, y: —</span>
+  </div>
 </div>
 
-</div><!-- shell -->
+<div id="status">
+  <span id="cellName">&mdash;</span>
+  <span id="coords">x: &mdash;, y: &mdash;</span>
+</div>
+
+</div>
 
 <script>
-// ── Data injected by Python ───────────────────────────────────────────────
+// ═══════════════════════════════════════════════════════════════════════════
+// KLayout built-in stipple/dither patterns — transcribed from
+// layDitherPattern.cc in the KLayout source.
+// Each entry is an array of row strings ('*' = set, '.' = unset).
+// ═══════════════════════════════════════════════════════════════════════════
+const STIPPLES = [
+  // 0: solid
+  ['*'],
+  // 1: hollow
+  ['.'],
+  // 2: dotted
+  ['*.','.*'],
+  // 3: coarsely dotted
+  ['*...','....','..*.','....'],
+  // 4: left-hatched
+  ['*...','.*..','..*.',
+   '...*'],
+  // 5: lightly left-hatched
+  ['*.......',
+   '.*......',
+   '..*.....',
+   '...*....',
+   '....*...',
+   '.....*..',
+   '......*.',
+   '.......*'],
+  // 6: strongly left-hatched dense
+  ['**..','.**.','..**','*..*'],
+  // 7: strongly left-hatched sparse
+  ['**......','.**.....','..**....','...**...','....**..',
+   '.....**.',  '......**','*......*'],
+  // 8: right-hatched
+  ['*...','...*','..*.','.*..'],
+  // 9: lightly right-hatched
+  ['*.......',
+   '.......*',
+   '......*.',
+   '.....*..',
+   '....*...',
+   '...*....',
+   '..*.....',
+   '.*......'],
+  // 10: strongly right-hatched dense
+  ['**..','*..*','..**','.**.' ],
+  // 11: strongly right-hatched sparse
+  ['**......','*......*','......**','.....**.',
+   '....**..',  '...**...', '..**....','.*......'],
+  // 12: cross-hatched
+  ['*...','.*.*','..*.',
+   '.*.*'],
+  // 13: lightly cross-hatched
+  ['*.......',
+   '.*.....*',
+   '..*...*.',
+   '...*.*..',
+   '....*...',
+   '...*.*..',
+   '..*...*.',
+   '.*.....*'],
+  // 14: checkerboard 2px
+  ['**..','**..', '..**','..**'],
+  // 15: strongly cross-hatched sparse
+  ['**......','***....*','..**..**','...****.',
+   '....**..',  '...****.',  '..**..**','***....*'],
+  // 16: heavy checkerboard
+  ['****....','****....','****....','****....',
+   '....****','....****','....****','....****'],
+  // 17: hollow bubbles
+  ['.*...*..','*.*.....',  '.*...*..','....*.*.',
+   '.*...*..','*.*.....',  '.*...*..','....*.*.' ],
+  // 18: solid bubbles
+  ['.*...*..','***.....',  '.*...*..','....***.',
+   '.*...*..','***.....',  '.*...*..','....***.' ],
+  // 19: pyramids
+  ['.*......','*.*.....',  '****...*','........',
+   '....*...','...*.*..',  '..*****.',  '........'],
+  // 20: turned pyramids
+  ['****...*','*.*.....',  '.*......','........',
+   '..*****.',  '...*.*..',  '....*...','........'],
+  // 21: plus
+  ['..*...*.','..*.....',  '*****...','..*.....',
+   '..*...*.',  '......*.','*...****','......*.'],
+  // 22: minus
+  ['........','........',  '*****...','........',
+   '........','........','*...****','........'],
+  // 23: 22.5 degree down
+  ['*......*','.**.....',  '...**...','.....**.',
+   '*......*','.**.....',  '...**...','.....**.' ],
+  // 24: 22.5 degree up
+  ['*......*','.....**.',  '...**...','.**.....',
+   '*......*','.....**.',  '...**...','.*......'],
+  // 25: 67.5 degree down
+  ['*...*...','.*...*..','.*...*..', '..*...*.',
+   '..*...*.',  '...*...*','...*...*','*...*...'],
+  // 26: 67.5 degree up
+  ['...*...*','..*...*.','..*...*.',  '.*...*..',
+   '.*...*..',  '*...*...','*...*...','...*...*'],
+  // 27: 22.5 cross hatched
+  ['*......*','.**..**.',  '...**...','.**..**.',
+   '*......*','.**..**.',  '...**...','.**..**.' ],
+  // 28: zig zag
+  ['..*...*.',  '.*.*.*.*','*...*...',  '........',
+   '..*...*.',  '.*.*.*.*','*...*...',  '........'],
+  // 29: sine
+  ['..***...',  '.*...*..','*.....**',  '........',
+   '..***...',  '.*...*..','*.....**',  '........'],
+  // 30: heavy unordered
+  ['****.*.*','**.****.',  '*.**.***','*****.*.',
+   '.**.****','**.***.*',  '.****.**','*.*.****'],
+  // 31: light unordered
+  ['....*.*.',  '..*....*','.*..*...',
+   '.....*.*','*..*....','..*...*.',  '*....*..',  '.*.*....'],
+  // 32: vertical dense
+  ['*.','*.'],
+  // 33: vertical
+  ['.*..','.*..','.*..','.*..'],
+  // 34: vertical thick
+  ['.**.',  '.**.',  '.**.',  '.**.' ],
+  // 35: vertical sparse
+  ['...*....','...*....','...*....','...*....'],
+  // 36: vertical sparse thick
+  ['...**...','...**...','...**...','...**...'],
+  // 37: horizontal dense
+  ['**','..'],
+  // 38: horizontal
+  ['....','****','....','....'],
+  // 39: horizontal thick
+  ['....','****','****','....'],
+  // 40: horizontal sparse
+  ['........','........','........','********'],
+  // 41: horizontal sparse thick
+  ['........','........','********','********'],
+];
+
+// ═══════════════════════════════════════════════════════════════════════════
 const ALL_CELLS = {all_cells_json};
 const TOP_NAMES = {top_names_json};
 const CELL_TREE = {cell_tree_json};
 const INIT_CELL = {init_cell_json};
 const UNIT      = "{unit}";
-const PSIZE     = 14;
 
-// ── Runtime state ─────────────────────────────────────────────────────────
-let LAYERS   = [];
-let GX, GY, GW, GH;
-let patterns = [];
+// ── State ─────────────────────────────────────────────────────────────────
+let LAYERS = [], GX, GY, GW, GH;
+let fillPatterns = [], frameColors = [];
 const hiddenNums = new Set();
 let showGrid = false;
 let sc, tx, ty, iSc, iTx, iTy;
 let activeCellName = '';
 
-// ── DOM refs ──────────────────────────────────────────────────────────────
 const wrap = document.getElementById('wrap');
 const cv   = document.getElementById('cv');
 const sel  = document.getElementById('selbox');
@@ -420,65 +529,69 @@ function resizeCanvas(){{
   cv.height = wrap.offsetHeight || 580;
 }}
 
-// ── Hatch pattern builder ─────────────────────────────────────────────────
-function buildPattern(fill, stroke, ptype){{
+// ── Build a CanvasPattern from a KLayout stipple bitmap ───────────────────
+// Key: the stipple is in SCREEN pixels, constant size regardless of zoom.
+// Only pixels where bitmap='*' are drawn in fillColor; '.' stays transparent.
+// This is exactly how KLayout renders — you see through the gaps.
+function buildStipplePattern(fillColor, stipIdx){{
+  const bmp = STIPPLES[stipIdx] || STIPPLES[0];
+  const h = bmp.length, w = bmp[0].length;
   const oc = document.createElement('canvas');
-  oc.width = oc.height = PSIZE;
-  const p = oc.getContext('2d');
-  const s = PSIZE, h = s/2, lw = Math.max(1, s*0.11);
-  p.fillStyle = fill; p.globalAlpha = 0.50; p.fillRect(0,0,s,s);
-  p.globalAlpha = 0.85; p.strokeStyle = stroke; p.lineWidth = lw; p.lineCap = 'butt';
-  if (ptype === 'dots') {{
-    p.fillStyle = stroke; p.beginPath(); p.arc(h,h,s*0.15,0,Math.PI*2); p.fill();
-  }} else {{
-    p.beginPath();
-    switch(ptype){{
-      case 'hlines':  p.moveTo(0,h);  p.lineTo(s,h); break;
-      case 'vlines':  p.moveTo(h,0);  p.lineTo(h,s); break;
-      case 'diag45':  p.moveTo(0,0);  p.lineTo(s,s); break;
-      case 'diag135': p.moveTo(s,0);  p.lineTo(0,s); break;
-      case 'cross':   p.moveTo(0,h);  p.lineTo(s,h); p.moveTo(h,0); p.lineTo(h,s); break;
-      case 'xcross':  p.moveTo(0,0);  p.lineTo(s,s); p.moveTo(s,0); p.lineTo(0,s); break;
+  oc.width = w; oc.height = h;
+  const p  = oc.getContext('2d');
+
+  // Parse fillColor to get r,g,b
+  let r=255,g=255,b=255;
+  if (fillColor.startsWith('#')) {{
+    const hex = fillColor.slice(1);
+    if (hex.length===6) {{
+      r=parseInt(hex.slice(0,2),16);
+      g=parseInt(hex.slice(2,4),16);
+      b=parseInt(hex.slice(4,6),16);
     }}
-    p.stroke();
   }}
-  return ctx.createPattern(oc,'repeat');
+
+  const img = p.createImageData(w, h);
+  for(let y=0;y<h;y++){{
+    const row = bmp[y];
+    for(let x=0;x<w;x++){{
+      const idx = (y*w+x)*4;
+      if(x < row.length && row[x]==='*'){{
+        img.data[idx]   = r;
+        img.data[idx+1] = g;
+        img.data[idx+2] = b;
+        img.data[idx+3] = 255;
+      }} else {{
+        img.data[idx+3] = 0;  // transparent
+      }}
+    }}
+  }}
+  p.putImageData(img, 0, 0);
+  return ctx.createPattern(oc, 'repeat');
 }}
 
-function drawSwatchOn(sw, fill, stroke, ptype){{
+// Sidebar swatch: fill a small canvas with the stipple pattern on dark bg
+function drawSwatchOn(sw, fillColor, frameColor, stipIdx){{
   const sc2 = sw.getContext('2d');
-  const ps2 = 7;
-  const oc  = document.createElement('canvas'); oc.width = oc.height = ps2;
-  const p   = oc.getContext('2d');
-  const s=ps2, h=s/2;
-  p.fillStyle=fill; p.globalAlpha=0.50; p.fillRect(0,0,s,s);
-  p.globalAlpha=0.85; p.strokeStyle=stroke; p.lineWidth=Math.max(1,s*0.11); p.lineCap='butt';
-  if(ptype==='dots'){{ p.fillStyle=stroke; p.beginPath(); p.arc(h,h,s*0.15,0,Math.PI*2); p.fill(); }}
-  else {{
-    p.beginPath();
-    switch(ptype){{
-      case 'hlines':  p.moveTo(0,h); p.lineTo(s,h); break;
-      case 'vlines':  p.moveTo(h,0); p.lineTo(h,s); break;
-      case 'diag45':  p.moveTo(0,0); p.lineTo(s,s); break;
-      case 'diag135': p.moveTo(s,0); p.lineTo(0,s); break;
-      case 'cross':   p.moveTo(0,h); p.lineTo(s,h); p.moveTo(h,0); p.lineTo(h,s); break;
-      case 'xcross':  p.moveTo(0,0); p.lineTo(s,s); p.moveTo(s,0); p.lineTo(0,s); break;
-    }}
-    p.stroke();
-  }}
-  const pat = sc2.createPattern(oc,'repeat');
-  sc2.fillStyle = pat; sc2.fillRect(0,0,sw.width,sw.height);
-  sc2.strokeStyle='#555'; sc2.lineWidth=1; sc2.strokeRect(0.5,0.5,sw.width-1,sw.height-1);
+  sc2.fillStyle = '#000';
+  sc2.fillRect(0, 0, sw.width, sw.height);
+
+  const pat = buildStipplePattern(fillColor, stipIdx);
+  sc2.fillStyle = pat;
+  sc2.fillRect(0, 0, sw.width, sw.height);
+
+  sc2.strokeStyle = frameColor;
+  sc2.lineWidth = 1;
+  sc2.strokeRect(0.5, 0.5, sw.width-1, sw.height-1);
 }}
 
 // ── Layer panel ───────────────────────────────────────────────────────────
 function buildLayerPanel(){{
   const list = document.getElementById('layerScroll');
   list.innerHTML = '';
-  LAYERS.forEach(([lnum, lname, fill, stroke, ptype], i) => {{
+  LAYERS.forEach(([lnum, lname, fill, frame, stipIdx], i) => {{
     const row = document.createElement('div');
     row.className = 'lr' + (hiddenNums.has(lnum) ? ' hidden' : '');
-    row.id = 'lr' + i;
 
     const cb = document.createElement('input');
     cb.type='checkbox'; cb.id='lc'+i; cb.checked=!hiddenNums.has(lnum);
@@ -497,7 +610,7 @@ function buildLayerPanel(){{
 
     row.append(cb, sw, lnum_span, lbl);
     list.appendChild(row);
-    drawSwatchOn(sw, fill, stroke, ptype);
+    drawSwatchOn(sw, fill, frame, stipIdx);
 
     const toggle = () => {{
       if(cb.checked) hiddenNums.delete(lnum); else hiddenNums.add(lnum);
@@ -511,7 +624,7 @@ function buildLayerPanel(){{
 
 document.getElementById('bShowAll').onclick = () => {{
   hiddenNums.clear();
-  document.querySelectorAll('#layerScroll .lr').forEach((r,i) => {{
+  document.querySelectorAll('#layerScroll .lr').forEach(r => {{
     r.className='lr'; r.querySelector('input').checked=true; }});
   render();
 }};
@@ -527,12 +640,10 @@ function makeTreeNode(name, depth){{
   const children = (CELL_TREE[name] || []).filter(c => ALL_CELLS[c]);
   const hasData  = !!ALL_CELLS[name];
   const isTop    = TOP_NAMES.includes(name);
-
-  const wrap2 = document.createElement('div');
+  const wrap2    = document.createElement('div');
 
   const row = document.createElement('div');
   row.className = 'tnode' + (name===activeCellName ? ' active' : '');
-  row.id = 'tn_' + CSS.escape(name);
   row.style.paddingLeft = (4 + depth*14) + 'px';
 
   const tog = document.createElement('span');
@@ -541,8 +652,7 @@ function makeTreeNode(name, depth){{
 
   const lbl = document.createElement('span');
   lbl.className = 'tn-lbl' + (isTop ? ' toplevel' : '');
-  lbl.textContent = name;
-  lbl.title = name;
+  lbl.textContent = name; lbl.title = name;
 
   row.append(tog, lbl);
   wrap2.appendChild(row);
@@ -562,16 +672,13 @@ function makeTreeNode(name, depth){{
         children.forEach(c => childBox.appendChild(makeTreeNode(c, depth+1)));
     }};
   }}
-
   if(hasData){{
     row.onclick = () => {{
       document.querySelectorAll('.tnode.active').forEach(el => el.classList.remove('active'));
       row.classList.add('active');
       loadCell(name);
     }};
-  }} else {{
-    lbl.style.color = '#888';
-  }}
+  }} else {{ lbl.style.color = '#888'; }}
   return wrap2;
 }}
 
@@ -579,7 +686,6 @@ function buildCellTree(){{
   const container = document.getElementById('cellScroll');
   container.innerHTML = '';
   TOP_NAMES.forEach(name => container.appendChild(makeTreeNode(name, 0)));
-  // cells that exist but aren't top-level and aren't reachable (orphans)
   const reachable = new Set();
   function mark(n){{ (CELL_TREE[n]||[]).forEach(c=>{{ if(!reachable.has(c)){{ reachable.add(c); mark(c); }} }}); }}
   TOP_NAMES.forEach(n=>{{ reachable.add(n); mark(n); }});
@@ -588,13 +694,16 @@ function buildCellTree(){{
   }});
 }}
 
-// ── Load a cell ───────────────────────────────────────────────────────────
+// ── Load cell ─────────────────────────────────────────────────────────────
 function loadCell(name){{
   const cd = ALL_CELLS[name]; if(!cd) return;
   activeCellName = name;
-  LAYERS   = cd.l;
+  LAYERS = cd.l;
   [GX,GY,GW,GH] = cd.b;
-  patterns = LAYERS.map(([,, fill,stroke,ptype]) => buildPattern(fill,stroke,ptype));
+
+  fillPatterns = LAYERS.map(([,,fill,,stipIdx]) => buildStipplePattern(fill, stipIdx));
+  frameColors  = LAYERS.map(([,,,frame]) => frame);
+
   buildLayerPanel();
   document.getElementById('cellName').textContent = name;
   if(cv.width){{ fitView(); render(); }}
@@ -609,59 +718,38 @@ function fitView(){{
   iSc=sc; iTx=tx; iTy=ty;
   updateZoom();
 }}
-
 function updateZoom(){{
-  // Compute zoom relative to "fit" scale
-  const pct = Math.round(sc/iSc*100);
-  document.getElementById('zoomLbl').textContent = pct+'%';
+  document.getElementById('zoomLbl').textContent = Math.round(sc/iSc*100)+'%';
 }}
 
-// ── Grid overlay ──────────────────────────────────────────────────────────
+// ── Grid ──────────────────────────────────────────────────────────────────
 function drawGrid(){{
-  const W=cv.width, H=cv.height;
-  // How many GDS units per pixel
-  const uPx = 1/sc;
-  // Target ~60 px between minor lines, ~300 px between major lines
-  let minor = niceNum(uPx*60);
-  let major = minor*5;
-
+  const W=cv.width, H=cv.height, uPx=1/sc;
+  let minor=niceNum(uPx*60), major=minor*5;
   ctx.save();
-  // minor grid
-  ctx.strokeStyle='rgba(255,255,255,0.06)';
-  ctx.lineWidth=1;
+  ctx.strokeStyle='rgba(255,255,255,0.08)'; ctx.lineWidth=1;
   drawGridLines(W,H,minor);
-  // major grid
-  ctx.strokeStyle='rgba(255,255,255,0.14)';
-  ctx.lineWidth=1;
+  ctx.strokeStyle='rgba(255,255,255,0.18)'; ctx.lineWidth=1;
   drawGridLines(W,H,major);
-  // major labels
-  ctx.fillStyle='rgba(200,220,255,0.55)';
-  ctx.font='9px monospace';
-  const x0=Math.ceil(-tx/sc/major)*major;
-  for(let gx=x0; gx*sc+tx<W; gx+=major){{
-    const sx=gx*sc+tx;
-    ctx.fillText(fmtCoord(gx), sx+2, H-4);
-  }}
-  const y0=Math.ceil(-ty/sc/major)*major;
-  for(let gy=y0; gy*sc+ty<H; gy+=major){{
-    const sy=gy*sc+ty;
-    ctx.fillText(fmtCoord(-gy), 4, sy-2);  // negate: canvas y is flipped
-  }}
+  ctx.fillStyle='rgba(180,200,255,0.5)'; ctx.font='9px monospace';
+  let x0=Math.ceil(-tx/sc/major)*major;
+  for(let gx=x0; gx*sc+tx<W; gx+=major) ctx.fillText(fmtCoord(gx), gx*sc+tx+2, H-4);
+  let y0=Math.ceil(-ty/sc/major)*major;
+  for(let gy=y0; gy*sc+ty<H; gy+=major) ctx.fillText(fmtCoord(-gy), 4, gy*sc+ty-2);
   ctx.restore();
 }}
 function drawGridLines(W,H,step){{
   ctx.beginPath();
-  const x0=Math.ceil(-tx/sc/step)*step;
-  for(let gx=x0; gx*sc+tx<W+1; gx+=step){{ const sx=gx*sc+tx; ctx.moveTo(sx,0); ctx.lineTo(sx,H); }}
-  const y0=Math.ceil(-ty/sc/step)*step;
-  for(let gy=y0; gy*sc+ty<H+1; gy+=step){{ const sy=gy*sc+ty; ctx.moveTo(0,sy); ctx.lineTo(W,sy); }}
+  let x0=Math.ceil(-tx/sc/step)*step;
+  for(let gx=x0; gx*sc+tx<W+1; gx+=step){{ let sx=gx*sc+tx; ctx.moveTo(sx,0); ctx.lineTo(sx,H); }}
+  let y0=Math.ceil(-ty/sc/step)*step;
+  for(let gy=y0; gy*sc+ty<H+1; gy+=step){{ let sy=gy*sc+ty; ctx.moveTo(0,sy); ctx.lineTo(W,sy); }}
   ctx.stroke();
 }}
 function fmtCoord(v){{ return (Math.abs(v)<1000?+v.toPrecision(4):Math.round(v))+''; }}
 
-// ── Ruler ─────────────────────────────────────────────────────────────────
 function niceNum(x){{
-  if(x<=0)return 1;
+  if(x<=0) return 1;
   const m=Math.pow(10,Math.floor(Math.log10(x))), f=x/m;
   return f<1.5?m : f<3.5?2*m : f<7.5?5*m : 10*m;
 }}
@@ -672,30 +760,53 @@ function updateRuler(){{
     (gl%1===0?gl:gl.toPrecision(3))+' '+UNIT;
 }}
 
-// ── Main render ───────────────────────────────────────────────────────────
+// ══════════════════════════════════════════════════════════════════════════
+// RENDER — KLayout-style:
+//   1. Black background
+//   2. For each visible layer, for each polygon:
+//      a. Fill with stipple pattern (opaque at '*' pixels, transparent at '.')
+//      b. Stroke outline in frame_color (1px)
+//   3. Because stipple has transparent gaps, you see through to layers below
+//      and the black background — same visual as KLayout/kwasm.
+// ══════════════════════════════════════════════════════════════════════════
 function render(){{
   const W=cv.width, H=cv.height;
-  ctx.clearRect(0,0,W,H);
+  ctx.fillStyle='#000';
+  ctx.fillRect(0,0,W,H);
   if(showGrid) drawGrid();
 
   const wxMin=-tx/sc, wyMin=-ty/sc;
   const wxMax=(W-tx)/sc, wyMax=(H-ty)/sc;
 
-  for(let li=0;li<LAYERS.length;li++){{
-    const [lnum,,fill,stroke,ptype,polys,bounds]=LAYERS[li];
+  for(let li=0; li<LAYERS.length; li++){{
+    const [lnum,,,,, polys, bounds] = LAYERS[li];
     if(hiddenNums.has(lnum)) continue;
-    const pat=patterns[li];
-    pat.setTransform(new DOMMatrix([1,0,0,1, tx%PSIZE, ty%PSIZE]));
-    ctx.fillStyle=pat;
-    for(let pi=0;pi<polys.length;pi++){{
-      const [bx0,by0,bx1,by1]=bounds[pi];
+
+    const pat   = fillPatterns[li];
+    const frc   = frameColors[li];
+
+    // Anchor stipple to screen origin (fixed pixel grid)
+    pat.setTransform(new DOMMatrix([1,0,0,1, tx%1, ty%1]));
+
+    for(let pi=0; pi<polys.length; pi++){{
+      const [bx0,by0,bx1,by1] = bounds[pi];
       if(bx1<wxMin||bx0>wxMax||by1<wyMin||by0>wyMax) continue;
-      const poly=polys[pi];
+
+      const poly = polys[pi];
       ctx.beginPath();
       ctx.moveTo(poly[0]*sc+tx, poly[1]*sc+ty);
-      for(let k=2;k<poly.length;k+=2)
+      for(let k=2; k<poly.length; k+=2)
         ctx.lineTo(poly[k]*sc+tx, poly[k+1]*sc+ty);
-      ctx.closePath(); ctx.fill();
+      ctx.closePath();
+
+      // Stipple fill
+      ctx.fillStyle = pat;
+      ctx.fill();
+
+      // Frame outline (1px, KLayout style)
+      ctx.strokeStyle = frc;
+      ctx.lineWidth = 1;
+      ctx.stroke();
     }}
   }}
   updateRuler();
@@ -717,10 +828,10 @@ function setMode(m){{
   ['bPan','bBox'].forEach(id=>document.getElementById(id).classList.remove('on'));
   document.getElementById(m==='pan'?'bPan':'bBox').classList.add('on');
 }}
-document.getElementById('bPan').onclick  = ()=>setMode('pan');
-document.getElementById('bBox').onclick  = ()=>setMode('zoombox');
-document.getElementById('bReset').onclick= ()=>{{sc=iSc;tx=iTx;ty=iTy;updateZoom();render();}};
-document.getElementById('bGrid').onclick = ()=>{{
+document.getElementById('bPan').onclick   = ()=>setMode('pan');
+document.getElementById('bBox').onclick   = ()=>setMode('zoombox');
+document.getElementById('bReset').onclick = ()=>{{sc=iSc;tx=iTx;ty=iTy;updateZoom();render();}};
+document.getElementById('bGrid').onclick  = ()=>{{
   showGrid=!showGrid;
   document.getElementById('bGrid').classList.toggle('on',showGrid);
   render();
@@ -736,7 +847,7 @@ wrap.addEventListener('wheel',e=>{{
   updateZoom(); render();
 }},{{passive:false}});
 
-// ── Mouse drag (pan / box-zoom) ───────────────────────────────────────────
+// ── Mouse drag ────────────────────────────────────────────────────────────
 let drag=false, dsx,dsy,dtx,dty,bx0,by0;
 wrap.addEventListener('mousedown',e=>{{
   if(e.button!==0&&e.button!==1) return;
@@ -755,8 +866,8 @@ window.addEventListener('mousemove',e=>{{
     const r=wrap.getBoundingClientRect();
     const cx=Math.max(0,Math.min(r.width, e.clientX-r.left));
     const cy=Math.max(0,Math.min(r.height,e.clientY-r.top));
-    sel.style.left  =Math.min(bx0,cx)+'px'; sel.style.top   =Math.min(by0,cy)+'px';
-    sel.style.width =Math.abs(cx-bx0)+'px'; sel.style.height=Math.abs(cy-by0)+'px';
+    sel.style.left=Math.min(bx0,cx)+'px'; sel.style.top=Math.min(by0,cy)+'px';
+    sel.style.width=Math.abs(cx-bx0)+'px'; sel.style.height=Math.abs(cy-by0)+'px';
   }}
 }});
 window.addEventListener('mouseup',e=>{{
@@ -778,27 +889,25 @@ window.addEventListener('mouseup',e=>{{
   }}
 }});
 
-// ── Cursor coordinates ────────────────────────────────────────────────────
 wrap.addEventListener('mousemove',e=>{{
   const r=wrap.getBoundingClientRect();
   const wx= ((e.clientX-r.left)-tx)/sc;
-  const wy=-((e.clientY-r.top) -ty)/sc;  // negate: canvas y is flipped
+  const wy=-((e.clientY-r.top) -ty)/sc;
   const fmt=v=>(Math.abs(v)<1e4?+v.toPrecision(5):Math.round(v));
   document.getElementById('coords').textContent=
     'x: '+fmt(wx)+' '+UNIT+',  y: '+fmt(wy)+' '+UNIT;
 }});
 wrap.addEventListener('mouseleave',()=>{{
-  document.getElementById('coords').textContent='x: —, y: —';
+  document.getElementById('coords').textContent='x: \\u2014, y: \\u2014';
 }});
 
-// ── Double-click → reset ──────────────────────────────────────────────────
 wrap.addEventListener('dblclick',()=>{{sc=iSc;tx=iTx;ty=iTy;updateZoom();render();}});
 </script></body></html>"""
 
                 components.html(html, height=700)
                 st.caption(
-                    "Scroll to zoom · Drag to pan/box-zoom · Double-click to fit · "
-                    "Grid button toggles overlay · Click any cell in the tree to switch view")
+                    "Scroll to zoom \u00b7 Drag to pan/box-zoom \u00b7 "
+                    "Double-click to fit \u00b7 Grid toggles overlay")
 
         except Exception as e:
             st.error(f"Viewer Error: {e}")
