@@ -30,9 +30,10 @@ def _unit_label(lib_unit):
 
 
 def _parse_lyp(lyp_bytes):
-    """Parse a KLayout .lyp XML file.
-    Returns {layer_number: hex_color} for visible layers only."""
+    """Parse a KLayout .lyp file.
+    Returns ({layer: hex_color}, {layer: name}) for visible layers."""
     layer_colors = {}
+    layer_names  = {}
     try:
         root = ET.fromstring(lyp_bytes)
         for props in root.findall(".//properties"):
@@ -40,27 +41,28 @@ def _parse_lyp(lyp_bytes):
                 continue
             source = props.findtext("source", "").strip()
             color  = props.findtext("fill-color", "").strip()
+            name   = props.findtext("name",       "").strip()
             if not source or not color:
                 continue
             try:
                 layer = int(source.split("/")[0])
                 layer_colors[layer] = color
+                if name:
+                    layer_names[layer] = name
             except (ValueError, IndexError):
                 continue
     except ET.ParseError:
         pass
-    return layer_colors
+    return layer_colors, layer_names
 
 
-def _build_cell_data(cell, layer_colors=None):
+def _build_cell_data(cell, layer_colors=None, layer_names=None):
     """Build canvas render data for a single gdstk Cell (polygons flattened).
 
     Returns (layers_list, vb_x, vb_y, vb_w, vb_h) or (None, 0,0,1,1).
 
     Each entry in layers_list:
-        [layer_num, fill, stroke, ptype, polys, bounds]
-    polys[i]  = flat [x0,y0,x1,y1,...] (2 dp)
-    bounds[i] = [minX, minY, maxX, maxY]  (pre-computed for cull)
+        [layer_num, display_name, fill, stroke, ptype, polys, bounds]
     """
     layer_polys = defaultdict(list)
     all_x, all_y = [], []
@@ -70,7 +72,7 @@ def _build_cell_data(cell, layer_colors=None):
         if len(pts) < 3:
             continue
         xs = pts[:, 0]
-        ys = -pts[:, 1]          # flip Y
+        ys = -pts[:, 1]
         all_x.extend(xs.tolist())
         all_y.extend(ys.tolist())
 
@@ -100,15 +102,17 @@ def _build_cell_data(cell, layer_colors=None):
         fill_color   = (layer_colors or {}).get(layer_num, style[0])
         stroke_color = style[1]
         ptype        = style[2]
+        lname        = (layer_names or {}).get(layer_num, f"Layer {layer_num}")
 
         polys  = []
         bounds = []
         for (flat, bx0, by0, bx1, by1) in layer_polys[layer_num]:
             polys.append(flat)
-            bounds.append([round(bx0, 2), round(by0, 2),
-                           round(bx1, 2), round(by1, 2)])
+            bounds.append([round(bx0,2), round(by0,2),
+                           round(bx1,2), round(by1,2)])
 
-        layers_list.append([layer_num, fill_color, stroke_color, ptype, polys, bounds])
+        layers_list.append([layer_num, lname, fill_color,
+                            stroke_color, ptype, polys, bounds])
 
     return layers_list, vb_x, vb_y, vb_w, vb_h
 
@@ -163,11 +167,11 @@ def show_interactive_viewer():
                     st.error("No top-level cell found in GDS file.")
                     return
 
-                layer_colors = _parse_lyp(uploaded_lyp.read()) if uploaded_lyp else None
+                layer_colors, layer_names = (
+                    _parse_lyp(uploaded_lyp.read()) if uploaded_lyp else ({}, {}))
 
-                # Build data for every cell in the library that has geometry.
-                # top-level cells are listed first; the rest follow alphabetically.
-                top_names  = [c.name for c in top_cells]
+                # ── collect all library cells ──────────────────────────────
+                top_names = [c.name for c in top_cells]
                 try:
                     all_lib_cells = list(lib.cells)
                 except Exception:
@@ -178,10 +182,24 @@ def show_interactive_viewer():
                     key=lambda c: c.name)
                 ordered_cells = list(top_cells) + non_top
 
-                all_cells_data = {}
+                # ── cell hierarchy (parent → [child names]) ───────────────
+                cell_children: dict = {}
+                for cell in ordered_cells:
+                    children = []
+                    for ref in getattr(cell, "references", []):
+                        try:
+                            cname = ref.cell.name if ref.cell else ref.cell_name
+                            if cname not in children:
+                                children.append(cname)
+                        except Exception:
+                            pass
+                    cell_children[cell.name] = children
+
+                # ── per-cell render data ──────────────────────────────────
+                all_cells_data: dict = {}
                 for cell in ordered_cells:
                     layers_list, vb_x, vb_y, vb_w, vb_h = _build_cell_data(
-                        cell, layer_colors)
+                        cell, layer_colors, layer_names)
                     if layers_list is not None:
                         all_cells_data[cell.name] = {
                             "b": [vb_x, vb_y, vb_w, vb_h],
@@ -192,466 +210,595 @@ def show_interactive_viewer():
                     st.error("No geometry found in GDS file.")
                     return
 
-                # Initial cell = first top-level cell that has geometry
                 init_cell = next(
                     (n for n in top_names if n in all_cells_data),
                     next(iter(all_cells_data)))
 
-                unit           = _unit_label(lib.unit)
-                all_cells_json = json.dumps(all_cells_data, separators=(',', ':'))
-                top_names_json = json.dumps(top_names,      separators=(',', ':'))
-                init_cell_json = json.dumps(init_cell)
+                unit             = _unit_label(lib.unit)
+                all_cells_json   = json.dumps(all_cells_data,  separators=(',', ':'))
+                top_names_json   = json.dumps(top_names,        separators=(',', ':'))
+                cell_tree_json   = json.dumps(cell_children,    separators=(',', ':'))
+                init_cell_json   = json.dumps(init_cell)
 
                 html = f"""<!DOCTYPE html>
-<html><head><style>
+<html><head><meta charset="utf-8"><style>
+/* ── reset ── */
 *{{margin:0;padding:0;box-sizing:border-box}}
-body{{background:#d4d0c8;overflow:hidden;
-     font-family:"MS Sans Serif",Arial,sans-serif;font-size:11px;color:#000}}
+html,body{{height:100%;overflow:hidden;background:#d4d0c8;
+  font-family:"MS Sans Serif",Arial,sans-serif;font-size:11px;color:#000}}
 
-/* ── toolbar ── */
+/* ── shell ── */
+#shell{{display:flex;flex-direction:column;height:100%;}}
+
+/* ── Win98 toolbar ── */
 #toolbar{{
-  background:#d4d0c8;border-bottom:1px solid #808080;
-  padding:4px 6px;display:flex;gap:4px;align-items:center;user-select:none;
-  flex-shrink:0;
+  background:#d4d0c8;border-bottom:2px solid #808080;
+  padding:3px 5px;display:flex;gap:3px;align-items:center;
+  flex-shrink:0;user-select:none;flex-wrap:wrap;
 }}
 .btn{{
   background:#d4d0c8;color:#000;
   font:11px "MS Sans Serif",Arial,sans-serif;
-  padding:3px 10px;cursor:pointer;
+  padding:2px 8px;cursor:pointer;
   border-top:2px solid #dfdfdf;border-left:2px solid #dfdfdf;
   border-bottom:2px solid #404040;border-right:2px solid #404040;
-  outline:1px solid #000;white-space:nowrap;min-width:60px;text-align:center;
+  outline:1px solid #000;white-space:nowrap;text-align:center;
 }}
 .btn:active,.btn.on{{
   border-top:2px solid #404040;border-left:2px solid #404040;
   border-bottom:2px solid #dfdfdf;border-right:2px solid #dfdfdf;
-  padding:4px 9px 2px 11px;
+  padding:3px 7px 1px 9px;
 }}
-.btn:focus{{outline:1px dotted #000;outline-offset:-4px}}
-.sep{{width:1px;height:20px;background:#808080;border-right:1px solid #fff;margin:0 2px}}
+.btn:focus{{outline:1px dotted #000;outline-offset:-3px}}
+.sep{{width:1px;height:18px;background:#808080;border-right:1px solid #fff;margin:0 2px;flex-shrink:0}}
+#zoomLbl{{font:11px "MS Sans Serif",Arial,sans-serif;color:#000;padding:0 4px;min-width:48px}}
 
-/* ── body row: canvas + sidebar ── */
-#body{{display:flex;flex:1;overflow:hidden;}}
+/* ── body row ── */
+#body{{display:flex;flex:1;overflow:hidden;min-height:0}}
 
-/* ── canvas wrap ── */
+/* ── canvas wrapper ── */
 #wrap{{
-  position:relative;flex:1;
-  background:#1e1e2e;overflow:hidden;cursor:crosshair;
+  position:relative;flex:1;min-width:0;
+  background:#1a1a2e;overflow:hidden;cursor:crosshair;
 }}
 canvas{{display:block;}}
-#selbox{{
-  position:absolute;display:none;pointer-events:none;
-  border:1px dashed #fff;background:rgba(100,160,255,.12);
+#selbox{{position:absolute;display:none;pointer-events:none;
+  border:1px dashed #7af;background:rgba(80,140,255,.10);}}
+
+/* ── ruler overlay ── */
+#ruler{{position:absolute;bottom:28px;left:12px;z-index:10;
+  color:#ccc;font:10px/1.4 monospace;pointer-events:none;}}
+#rbar{{height:2px;background:#ccc;border-radius:1px;margin-bottom:3px}}
+#rlabel{{text-align:center;text-shadow:0 0 3px #000}}
+
+/* ── status bar ── */
+#status{{
+  height:18px;background:#d4d0c8;
+  border-top:1px solid #808080;padding:2px 6px;
+  display:flex;align-items:center;gap:16px;flex-shrink:0;
+  font:11px "MS Sans Serif",Arial,sans-serif;
 }}
-#ruler{{
-  position:absolute;bottom:16px;left:16px;z-index:10;
-  color:#e0e0e0;font:11px/1.4 monospace;pointer-events:none;
-}}
-#rbar{{height:3px;background:#e0e0e0;border-radius:1px;margin-bottom:4px}}
-#rlabel{{text-align:center;text-shadow:0 0 4px #000}}
+#coords{{color:#000;}}
+#cellName{{color:#000080;font-weight:bold;overflow:hidden;
+  text-overflow:ellipsis;white-space:nowrap;max-width:240px}}
 
 /* ── Win98 sidebar ── */
 #sidebar{{
-  width:168px;min-width:168px;
-  background:#d4d0c8;
+  width:195px;min-width:195px;background:#d4d0c8;
   border-left:2px solid #808080;
-  display:flex;flex-direction:column;
-  overflow:hidden;
+  display:flex;flex-direction:column;overflow:hidden;
 }}
 
-/* Win98 group-box */
+/* Win98 group-box panels */
 .gb{{
-  margin:6px 4px 0 4px;
+  margin:4px 4px 0 4px;flex-shrink:0;
   border-top:1px solid #808080;border-left:1px solid #808080;
   border-bottom:1px solid #dfdfdf;border-right:1px solid #dfdfdf;
-  flex-shrink:0;
 }}
-.gb.stretch{{flex:1;display:flex;flex-direction:column;overflow:hidden;min-height:80px}}
+.gb.grow{{flex:1;display:flex;flex-direction:column;overflow:hidden;min-height:60px}}
 .gb-title{{
   background:#d4d0c8;
   font:bold 11px "MS Sans Serif",Arial,sans-serif;
-  padding:2px 5px;
-  border-bottom:1px solid #808080;
-  user-select:none;
-}}
-
-/* Win98 listbox (cells) */
-#cellSel{{
-  display:block;width:100%;
-  background:#fff;color:#000;
-  font:11px "MS Sans Serif",Arial,sans-serif;
-  border:none;outline:none;
-  padding:0;margin:0;
-  flex:1;
-  overflow-y:auto;
-}}
-#cellSel option{{padding:1px 4px;}}
-#cellSel option.top-cell{{font-weight:bold;}}
-
-/* layer list */
-#layerScroll{{
-  overflow-y:auto;flex:1;
-  padding:2px 2px;
-}}
-.lr{{
+  padding:2px 5px;border-bottom:1px solid #808080;user-select:none;
   display:flex;align-items:center;gap:3px;
-  padding:1px 2px;cursor:pointer;user-select:none;
 }}
+
+/* ── cell tree ── */
+#cellScroll{{overflow-y:auto;flex:1;padding:1px 0}}
+.tnode{{display:flex;align-items:center;padding:1px 2px 1px 4px;cursor:pointer;white-space:nowrap}}
+.tnode:hover{{background:#b8c8e0}}
+.tnode.active{{background:#000080;color:#fff}}
+.tnode.active .tn-lbl{{color:#fff}}
+.tn-tog{{width:12px;text-align:center;flex-shrink:0;font-size:9px;color:#555;cursor:pointer;user-select:none}}
+.tnode.active .tn-tog{{color:#ccc}}
+.tn-lbl{{font:11px "MS Sans Serif",Arial,sans-serif;overflow:hidden;text-overflow:ellipsis}}
+.tn-lbl.toplevel{{font-weight:bold}}
+.tn-children{{display:none;}}
+
+/* ── layer panel ── */
+.lyr-ctrl{{display:flex;gap:2px;padding:2px 3px;border-bottom:1px solid #b0b0b0}}
+.sbtn{{
+  background:#d4d0c8;color:#000;font:10px "MS Sans Serif",Arial,sans-serif;
+  padding:1px 4px;cursor:pointer;border-radius:0;
+  border-top:1px solid #dfdfdf;border-left:1px solid #dfdfdf;
+  border-bottom:1px solid #808080;border-right:1px solid #808080;
+}}
+.sbtn:active{{border-color:#808080 #dfdfdf #dfdfdf #808080;padding:2px 3px 0 5px}}
+#layerScroll{{overflow-y:auto;flex:1;padding:1px 1px}}
+.lr{{display:flex;align-items:center;gap:3px;padding:1px 3px;cursor:pointer;user-select:none;}}
 .lr:hover{{background:#b0b8c8}}
-.lr input[type=checkbox]{{
-  width:12px;height:12px;margin:0;flex-shrink:0;cursor:pointer;
-}}
-.swatch{{
-  flex-shrink:0;
+.lr input[type=checkbox]{{width:11px;height:11px;margin:0;flex-shrink:0;cursor:pointer;}}
+.swatch{{flex-shrink:0;
   border-top:1px solid #808080;border-left:1px solid #808080;
-  border-bottom:1px solid #dfdfdf;border-right:1px solid #dfdfdf;
-}}
-.lr label{{
-  font:11px "MS Sans Serif",Arial,sans-serif;
-  white-space:nowrap;overflow:hidden;text-overflow:ellipsis;
-  cursor:pointer;
-}}
-.lr.hidden label{{color:#808080;text-decoration:line-through;}}
+  border-bottom:1px solid #dfdfdf;border-right:1px solid #dfdfdf;}}
+.lr label{{font:11px "MS Sans Serif",Arial,sans-serif;
+  white-space:nowrap;overflow:hidden;text-overflow:ellipsis;max-width:108px;cursor:pointer}}
+.lr.hidden label,.lr.hidden .lr-lnum{{color:#909090;text-decoration:line-through}}
+.lr-lnum{{font:9px monospace;color:#606060;flex-shrink:0}}
+</style></head><body><div id="shell">
 
-/* outer shell takes full viewport */
-html,body{{height:100%;overflow:hidden;}}
-#shell{{display:flex;flex-direction:column;height:100%;}}
-</style></head>
-<body><div id="shell">
-
+<!-- toolbar -->
 <div id="toolbar">
-  <button class="btn on" id="bPan"  title="Pan">&#128336; Pan</button>
-  <button class="btn"    id="bBox"  title="Box Zoom">&#9974; Box&nbsp;Zoom</button>
+  <button class="btn on" id="bPan"  title="Pan (drag)">&#9995; Pan</button>
+  <button class="btn"    id="bBox"  title="Box Zoom (drag rectangle)">&#9974; Zoom</button>
   <div class="sep"></div>
-  <button class="btn"    id="bReset" title="Fit (double-click also works)">&#8635; Reset</button>
+  <button class="btn"    id="bGrid" title="Toggle grid overlay">&#10166; Grid</button>
+  <button class="btn"    id="bReset" title="Fit entire layout (double-click also works)">&#8635; Fit</button>
+  <div class="sep"></div>
+  <span id="zoomLbl" title="Current zoom level">100%</span>
 </div>
 
+<!-- body: canvas + sidebar -->
 <div id="body">
+
+  <!-- canvas -->
   <div id="wrap">
     <canvas id="cv"></canvas>
     <div id="selbox"></div>
     <div id="ruler"><div id="rbar"></div><div id="rlabel"></div></div>
   </div>
 
+  <!-- sidebar -->
   <div id="sidebar">
-    <div class="gb">
-      <div class="gb-title">Cells</div>
-      <select id="cellSel" size="5"></select>
+
+    <!-- Cells group-box -->
+    <div class="gb" style="flex:0 0 auto;max-height:42%">
+      <div class="gb-title">&#128194; Cells</div>
+      <div id="cellScroll"></div>
     </div>
-    <div class="gb stretch">
-      <div class="gb-title">Layers</div>
+
+    <!-- Layers group-box -->
+    <div class="gb grow">
+      <div class="gb-title">
+        &#9632; Layers
+      </div>
+      <div class="lyr-ctrl">
+        <button class="sbtn" id="bShowAll">Show All</button>
+        <button class="sbtn" id="bHideAll">Hide All</button>
+      </div>
       <div id="layerScroll"></div>
     </div>
-  </div>
+
+  </div><!-- sidebar -->
+
+</div><!-- body -->
+
+<!-- status bar -->
+<div id="status">
+  <span id="cellName">—</span>
+  <span id="coords">x: —, y: —</span>
 </div>
 
-</div><!-- #shell -->
+</div><!-- shell -->
 
 <script>
 // ── Data injected by Python ───────────────────────────────────────────────
-const ALL_CELLS  = {all_cells_json};
-const TOP_NAMES  = {top_names_json};
-const INIT_CELL  = {init_cell_json};
-const UNIT       = "{unit}";
-const PSIZE      = 14;   // hatch tile size in px (constant, never rescales)
+const ALL_CELLS = {all_cells_json};
+const TOP_NAMES = {top_names_json};
+const CELL_TREE = {cell_tree_json};
+const INIT_CELL = {init_cell_json};
+const UNIT      = "{unit}";
+const PSIZE     = 14;
 
-// ── State ─────────────────────────────────────────────────────────────────
-let LAYERS   = [];        // current cell's layer list
-let GX, GY, GW, GH;      // current cell's world bounds
-let patterns = [];        // CanvasPattern per layer (rebuilt on cell change)
-const hiddenNums = new Set();  // layer numbers toggled off (persists across cells)
+// ── Runtime state ─────────────────────────────────────────────────────────
+let LAYERS   = [];
+let GX, GY, GW, GH;
+let patterns = [];
+const hiddenNums = new Set();
+let showGrid = false;
+let sc, tx, ty, iSc, iTx, iTy;
+let activeCellName = '';
 
-// ── Canvas / DOM refs ─────────────────────────────────────────────────────
+// ── DOM refs ──────────────────────────────────────────────────────────────
 const wrap = document.getElementById('wrap');
 const cv   = document.getElementById('cv');
 const sel  = document.getElementById('selbox');
 const ctx  = cv.getContext('2d');
 
 function resizeCanvas(){{
-  cv.width  = wrap.offsetWidth;
-  cv.height = wrap.offsetHeight;
+  cv.width  = wrap.offsetWidth  || 800;
+  cv.height = wrap.offsetHeight || 580;
 }}
 
-// ── Hatch pattern builder (offscreen 14×14 canvas tile) ──────────────────
+// ── Hatch pattern builder ─────────────────────────────────────────────────
 function buildPattern(fill, stroke, ptype){{
   const oc = document.createElement('canvas');
   oc.width = oc.height = PSIZE;
-  const p  = oc.getContext('2d');
-  const s  = PSIZE, h = s / 2, lw = Math.max(1, s * 0.11);
-  p.fillStyle   = fill;
-  p.globalAlpha = 0.50;
-  p.fillRect(0, 0, s, s);
-  p.globalAlpha = 0.85;
-  p.strokeStyle = stroke;
-  p.lineWidth   = lw;
-  p.lineCap     = 'butt';
+  const p = oc.getContext('2d');
+  const s = PSIZE, h = s/2, lw = Math.max(1, s*0.11);
+  p.fillStyle = fill; p.globalAlpha = 0.50; p.fillRect(0,0,s,s);
+  p.globalAlpha = 0.85; p.strokeStyle = stroke; p.lineWidth = lw; p.lineCap = 'butt';
   if (ptype === 'dots') {{
-    p.fillStyle = stroke;
-    p.beginPath(); p.arc(h, h, s * 0.15, 0, Math.PI * 2); p.fill();
+    p.fillStyle = stroke; p.beginPath(); p.arc(h,h,s*0.15,0,Math.PI*2); p.fill();
   }} else {{
     p.beginPath();
-    switch (ptype) {{
+    switch(ptype){{
       case 'hlines':  p.moveTo(0,h);  p.lineTo(s,h); break;
       case 'vlines':  p.moveTo(h,0);  p.lineTo(h,s); break;
       case 'diag45':  p.moveTo(0,0);  p.lineTo(s,s); break;
       case 'diag135': p.moveTo(s,0);  p.lineTo(0,s); break;
-      case 'cross':   p.moveTo(0,h);  p.lineTo(s,h);
-                      p.moveTo(h,0);  p.lineTo(h,s); break;
-      case 'xcross':  p.moveTo(0,0);  p.lineTo(s,s);
-                      p.moveTo(s,0);  p.lineTo(0,s); break;
+      case 'cross':   p.moveTo(0,h);  p.lineTo(s,h); p.moveTo(h,0); p.lineTo(h,s); break;
+      case 'xcross':  p.moveTo(0,0);  p.lineTo(s,s); p.moveTo(s,0); p.lineTo(0,s); break;
     }}
     p.stroke();
   }}
-  return ctx.createPattern(oc, 'repeat');
+  return ctx.createPattern(oc,'repeat');
 }}
 
-// Tiny swatch (22×14) rendered into a <canvas> element
-function drawSwatch(sw, fill, stroke, ptype){{
+function drawSwatchOn(sw, fill, stroke, ptype){{
   const sc2 = sw.getContext('2d');
-  const ps2 = 7;  // smaller tile for thumbnail
-  const oc  = document.createElement('canvas');
-  oc.width  = oc.height = ps2;
+  const ps2 = 7;
+  const oc  = document.createElement('canvas'); oc.width = oc.height = ps2;
   const p   = oc.getContext('2d');
-  const s   = ps2, h = s / 2;
-  p.fillStyle   = fill;   p.globalAlpha = 0.50; p.fillRect(0, 0, s, s);
-  p.globalAlpha = 0.85;   p.strokeStyle = stroke;
-  p.lineWidth   = Math.max(1, s * 0.11); p.lineCap = 'butt';
-  if (ptype === 'dots') {{
-    p.fillStyle = stroke; p.beginPath();
-    p.arc(h, h, s * 0.15, 0, Math.PI * 2); p.fill();
-  }} else {{
+  const s=ps2, h=s/2;
+  p.fillStyle=fill; p.globalAlpha=0.50; p.fillRect(0,0,s,s);
+  p.globalAlpha=0.85; p.strokeStyle=stroke; p.lineWidth=Math.max(1,s*0.11); p.lineCap='butt';
+  if(ptype==='dots'){{ p.fillStyle=stroke; p.beginPath(); p.arc(h,h,s*0.15,0,Math.PI*2); p.fill(); }}
+  else {{
     p.beginPath();
-    switch (ptype) {{
-      case 'hlines':  p.moveTo(0,h);  p.lineTo(s,h); break;
-      case 'vlines':  p.moveTo(h,0);  p.lineTo(h,s); break;
-      case 'diag45':  p.moveTo(0,0);  p.lineTo(s,s); break;
-      case 'diag135': p.moveTo(s,0);  p.lineTo(0,s); break;
-      case 'cross':   p.moveTo(0,h);  p.lineTo(s,h);
-                      p.moveTo(h,0);  p.lineTo(h,s); break;
-      case 'xcross':  p.moveTo(0,0);  p.lineTo(s,s);
-                      p.moveTo(s,0);  p.lineTo(0,s); break;
+    switch(ptype){{
+      case 'hlines':  p.moveTo(0,h); p.lineTo(s,h); break;
+      case 'vlines':  p.moveTo(h,0); p.lineTo(h,s); break;
+      case 'diag45':  p.moveTo(0,0); p.lineTo(s,s); break;
+      case 'diag135': p.moveTo(s,0); p.lineTo(0,s); break;
+      case 'cross':   p.moveTo(0,h); p.lineTo(s,h); p.moveTo(h,0); p.lineTo(h,s); break;
+      case 'xcross':  p.moveTo(0,0); p.lineTo(s,s); p.moveTo(s,0); p.lineTo(0,s); break;
     }}
     p.stroke();
   }}
-  const pat = sc2.createPattern(oc, 'repeat');
-  sc2.fillStyle = pat;
-  sc2.fillRect(0, 0, sw.width, sw.height);
-  sc2.strokeStyle = '#555'; sc2.lineWidth = 1;
-  sc2.strokeRect(0.5, 0.5, sw.width - 1, sw.height - 1);
+  const pat = sc2.createPattern(oc,'repeat');
+  sc2.fillStyle = pat; sc2.fillRect(0,0,sw.width,sw.height);
+  sc2.strokeStyle='#555'; sc2.lineWidth=1; sc2.strokeRect(0.5,0.5,sw.width-1,sw.height-1);
 }}
 
 // ── Layer panel ───────────────────────────────────────────────────────────
 function buildLayerPanel(){{
   const list = document.getElementById('layerScroll');
   list.innerHTML = '';
-  LAYERS.forEach(([lnum, fill, stroke, ptype], i) => {{
+  LAYERS.forEach(([lnum, lname, fill, stroke, ptype], i) => {{
     const row = document.createElement('div');
     row.className = 'lr' + (hiddenNums.has(lnum) ? ' hidden' : '');
     row.id = 'lr' + i;
 
-    const cb  = document.createElement('input');
-    cb.type   = 'checkbox';
-    cb.id     = 'lc' + i;
-    cb.checked = !hiddenNums.has(lnum);
+    const cb = document.createElement('input');
+    cb.type='checkbox'; cb.id='lc'+i; cb.checked=!hiddenNums.has(lnum);
 
-    const sw  = document.createElement('canvas');
-    sw.className = 'swatch';
-    sw.width  = 22; sw.height = 14;
+    const sw = document.createElement('canvas');
+    sw.className='swatch'; sw.width=22; sw.height=14;
+
+    const lnum_span = document.createElement('span');
+    lnum_span.className = 'lr-lnum';
+    lnum_span.textContent = lnum;
 
     const lbl = document.createElement('label');
-    lbl.htmlFor   = 'lc' + i;
-    lbl.textContent = 'Layer ' + lnum;
+    lbl.htmlFor = 'lc'+i;
+    lbl.textContent = lname;
+    lbl.title = lname + ' (layer ' + lnum + ')';
 
-    row.appendChild(cb);
-    row.appendChild(sw);
-    row.appendChild(lbl);
+    row.append(cb, sw, lnum_span, lbl);
     list.appendChild(row);
+    drawSwatchOn(sw, fill, stroke, ptype);
 
-    drawSwatch(sw, fill, stroke, ptype);
-
-    cb.addEventListener('change', () => {{
-      if (cb.checked) hiddenNums.delete(lnum);
-      else            hiddenNums.add(lnum);
+    const toggle = () => {{
+      if(cb.checked) hiddenNums.delete(lnum); else hiddenNums.add(lnum);
       row.className = 'lr' + (hiddenNums.has(lnum) ? ' hidden' : '');
       render();
-    }});
+    }};
+    cb.addEventListener('change', toggle);
+    row.addEventListener('click', e => {{ if(e.target!==cb && e.target!==lbl){{ cb.checked=!cb.checked; toggle(); }} }});
   }});
 }}
 
-// ── Cell selector ─────────────────────────────────────────────────────────
-function buildCellSelector(){{
-  const sel2 = document.getElementById('cellSel');
-  sel2.innerHTML = '';
+document.getElementById('bShowAll').onclick = () => {{
+  hiddenNums.clear();
+  document.querySelectorAll('#layerScroll .lr').forEach((r,i) => {{
+    r.className='lr'; r.querySelector('input').checked=true; }});
+  render();
+}};
+document.getElementById('bHideAll').onclick = () => {{
+  LAYERS.forEach(([lnum]) => hiddenNums.add(lnum));
+  document.querySelectorAll('#layerScroll .lr').forEach(r => {{
+    r.className='lr hidden'; r.querySelector('input').checked=false; }});
+  render();
+}};
 
-  // top-level cells first (bold via CSS class), then the rest
-  const topSet = new Set(TOP_NAMES);
-  Object.keys(ALL_CELLS).forEach(name => {{
-    const opt   = document.createElement('option');
-    opt.value   = name;
-    opt.textContent = name;
-    if (topSet.has(name)) opt.className = 'top-cell';
-    sel2.appendChild(opt);
-  }});
-  sel2.value = INIT_CELL;
-  sel2.addEventListener('change', () => loadCell(sel2.value));
+// ── Cell hierarchy tree ───────────────────────────────────────────────────
+function makeTreeNode(name, depth){{
+  const children = (CELL_TREE[name] || []).filter(c => ALL_CELLS[c]);
+  const hasData  = !!ALL_CELLS[name];
+  const isTop    = TOP_NAMES.includes(name);
+
+  const wrap2 = document.createElement('div');
+
+  const row = document.createElement('div');
+  row.className = 'tnode' + (name===activeCellName ? ' active' : '');
+  row.id = 'tn_' + CSS.escape(name);
+  row.style.paddingLeft = (4 + depth*14) + 'px';
+
+  const tog = document.createElement('span');
+  tog.className = 'tn-tog';
+  tog.textContent = children.length ? '▶' : ' ';
+
+  const lbl = document.createElement('span');
+  lbl.className = 'tn-lbl' + (isTop ? ' toplevel' : '');
+  lbl.textContent = name;
+  lbl.title = name;
+
+  row.append(tog, lbl);
+  wrap2.appendChild(row);
+
+  const childBox = document.createElement('div');
+  childBox.className = 'tn-children';
+  wrap2.appendChild(childBox);
+
+  let expanded = false;
+  if(children.length){{
+    tog.onclick = e => {{
+      e.stopPropagation();
+      expanded = !expanded;
+      tog.textContent = expanded ? '▼' : '▶';
+      childBox.style.display = expanded ? 'block' : 'none';
+      if(expanded && !childBox.children.length)
+        children.forEach(c => childBox.appendChild(makeTreeNode(c, depth+1)));
+    }};
+  }}
+
+  if(hasData){{
+    row.onclick = () => {{
+      document.querySelectorAll('.tnode.active').forEach(el => el.classList.remove('active'));
+      row.classList.add('active');
+      loadCell(name);
+    }};
+  }} else {{
+    lbl.style.color = '#888';
+  }}
+  return wrap2;
 }}
 
-// ── Load a cell by name ───────────────────────────────────────────────────
+function buildCellTree(){{
+  const container = document.getElementById('cellScroll');
+  container.innerHTML = '';
+  TOP_NAMES.forEach(name => container.appendChild(makeTreeNode(name, 0)));
+  // cells that exist but aren't top-level and aren't reachable (orphans)
+  const reachable = new Set();
+  function mark(n){{ (CELL_TREE[n]||[]).forEach(c=>{{ if(!reachable.has(c)){{ reachable.add(c); mark(c); }} }}); }}
+  TOP_NAMES.forEach(n=>{{ reachable.add(n); mark(n); }});
+  Object.keys(ALL_CELLS).forEach(n => {{
+    if(!reachable.has(n)) container.appendChild(makeTreeNode(n, 0));
+  }});
+}}
+
+// ── Load a cell ───────────────────────────────────────────────────────────
 function loadCell(name){{
-  const cd = ALL_CELLS[name];
-  if (!cd) return;
-  LAYERS    = cd.l;
-  [GX, GY, GW, GH] = cd.b;
-  patterns  = LAYERS.map(([,fill,stroke,ptype]) => buildPattern(fill, stroke, ptype));
+  const cd = ALL_CELLS[name]; if(!cd) return;
+  activeCellName = name;
+  LAYERS   = cd.l;
+  [GX,GY,GW,GH] = cd.b;
+  patterns = LAYERS.map(([,, fill,stroke,ptype]) => buildPattern(fill,stroke,ptype));
   buildLayerPanel();
-  if (cv.width) {{ fitView(); render(); }}
+  document.getElementById('cellName').textContent = name;
+  if(cv.width){{ fitView(); render(); }}
 }}
 
-// ── View state: sc=px/GDSunit, tx/ty=screen pos of world origin ──────────
-let sc, tx, ty, iSc, iTx, iTy;
-
+// ── View ──────────────────────────────────────────────────────────────────
 function fitView(){{
-  const W = cv.width, H = cv.height;
-  sc = Math.min(W / GW, H / GH) * 0.97;
-  tx = (W - GW * sc) / 2 - GX * sc;
-  ty = (H - GH * sc) / 2 - GY * sc;
-  iSc = sc; iTx = tx; iTy = ty;
+  const W=cv.width, H=cv.height;
+  sc = Math.min(W/GW, H/GH)*0.97;
+  tx = (W-GW*sc)/2 - GX*sc;
+  ty = (H-GH*sc)/2 - GY*sc;
+  iSc=sc; iTx=tx; iTy=ty;
+  updateZoom();
 }}
+
+function updateZoom(){{
+  // Compute zoom relative to "fit" scale
+  const pct = Math.round(sc/iSc*100);
+  document.getElementById('zoomLbl').textContent = pct+'%';
+}}
+
+// ── Grid overlay ──────────────────────────────────────────────────────────
+function drawGrid(){{
+  const W=cv.width, H=cv.height;
+  // How many GDS units per pixel
+  const uPx = 1/sc;
+  // Target ~60 px between minor lines, ~300 px between major lines
+  let minor = niceNum(uPx*60);
+  let major = minor*5;
+
+  ctx.save();
+  // minor grid
+  ctx.strokeStyle='rgba(255,255,255,0.06)';
+  ctx.lineWidth=1;
+  drawGridLines(W,H,minor);
+  // major grid
+  ctx.strokeStyle='rgba(255,255,255,0.14)';
+  ctx.lineWidth=1;
+  drawGridLines(W,H,major);
+  // major labels
+  ctx.fillStyle='rgba(200,220,255,0.55)';
+  ctx.font='9px monospace';
+  const x0=Math.ceil(-tx/sc/major)*major;
+  for(let gx=x0; gx*sc+tx<W; gx+=major){{
+    const sx=gx*sc+tx;
+    ctx.fillText(fmtCoord(gx), sx+2, H-4);
+  }}
+  const y0=Math.ceil(-ty/sc/major)*major;
+  for(let gy=y0; gy*sc+ty<H; gy+=major){{
+    const sy=gy*sc+ty;
+    ctx.fillText(fmtCoord(-gy), 4, sy-2);  // negate: canvas y is flipped
+  }}
+  ctx.restore();
+}}
+function drawGridLines(W,H,step){{
+  ctx.beginPath();
+  const x0=Math.ceil(-tx/sc/step)*step;
+  for(let gx=x0; gx*sc+tx<W+1; gx+=step){{ const sx=gx*sc+tx; ctx.moveTo(sx,0); ctx.lineTo(sx,H); }}
+  const y0=Math.ceil(-ty/sc/step)*step;
+  for(let gy=y0; gy*sc+ty<H+1; gy+=step){{ const sy=gy*sc+ty; ctx.moveTo(0,sy); ctx.lineTo(W,sy); }}
+  ctx.stroke();
+}}
+function fmtCoord(v){{ return (Math.abs(v)<1000?+v.toPrecision(4):Math.round(v))+''; }}
 
 // ── Ruler ─────────────────────────────────────────────────────────────────
 function niceNum(x){{
-  const m = Math.pow(10, Math.floor(Math.log10(x))), f = x / m;
-  return f < 1.5 ? m : f < 3.5 ? 2*m : f < 7.5 ? 5*m : 10*m;
+  if(x<=0)return 1;
+  const m=Math.pow(10,Math.floor(Math.log10(x))), f=x/m;
+  return f<1.5?m : f<3.5?2*m : f<7.5?5*m : 10*m;
 }}
 function updateRuler(){{
-  const gpx = 1 / sc, gl = niceNum(gpx * 120), bp = gl * sc;
-  document.getElementById('rbar').style.width = bp + 'px';
-  document.getElementById('rlabel').textContent =
-    (gl % 1 === 0 ? gl : gl.toPrecision(3)) + ' ' + UNIT;
+  const gpx=1/sc, gl=niceNum(gpx*120), bp=gl*sc;
+  document.getElementById('rbar').style.width=bp+'px';
+  document.getElementById('rlabel').textContent=
+    (gl%1===0?gl:gl.toPrecision(3))+' '+UNIT;
 }}
 
-// ── Render ────────────────────────────────────────────────────────────────
+// ── Main render ───────────────────────────────────────────────────────────
 function render(){{
-  const W = cv.width, H = cv.height;
-  ctx.clearRect(0, 0, W, H);
+  const W=cv.width, H=cv.height;
+  ctx.clearRect(0,0,W,H);
+  if(showGrid) drawGrid();
 
-  const wxMin = -tx / sc,       wyMin = -ty / sc;
-  const wxMax = (W - tx) / sc,  wyMax = (H - ty) / sc;
+  const wxMin=-tx/sc, wyMin=-ty/sc;
+  const wxMax=(W-tx)/sc, wyMax=(H-ty)/sc;
 
-  for (let li = 0; li < LAYERS.length; li++) {{
-    const [lnum, fill, stroke, ptype, polys, bounds] = LAYERS[li];
-    if (hiddenNums.has(lnum)) continue;
-
-    const pat = patterns[li];
-    pat.setTransform(new DOMMatrix([1, 0, 0, 1, tx % PSIZE, ty % PSIZE]));
-    ctx.fillStyle = pat;
-
-    for (let pi = 0; pi < polys.length; pi++) {{
-      const [bx0, by0, bx1, by1] = bounds[pi];
-      if (bx1 < wxMin || bx0 > wxMax || by1 < wyMin || by0 > wyMax) continue;
-
-      const poly = polys[pi];
+  for(let li=0;li<LAYERS.length;li++){{
+    const [lnum,,fill,stroke,ptype,polys,bounds]=LAYERS[li];
+    if(hiddenNums.has(lnum)) continue;
+    const pat=patterns[li];
+    pat.setTransform(new DOMMatrix([1,0,0,1, tx%PSIZE, ty%PSIZE]));
+    ctx.fillStyle=pat;
+    for(let pi=0;pi<polys.length;pi++){{
+      const [bx0,by0,bx1,by1]=bounds[pi];
+      if(bx1<wxMin||bx0>wxMax||by1<wyMin||by0>wyMax) continue;
+      const poly=polys[pi];
       ctx.beginPath();
-      ctx.moveTo(poly[0] * sc + tx, poly[1] * sc + ty);
-      for (let k = 2; k < poly.length; k += 2)
-        ctx.lineTo(poly[k] * sc + tx, poly[k+1] * sc + ty);
-      ctx.closePath();
-      ctx.fill();
+      ctx.moveTo(poly[0]*sc+tx, poly[1]*sc+ty);
+      for(let k=2;k<poly.length;k+=2)
+        ctx.lineTo(poly[k]*sc+tx, poly[k+1]*sc+ty);
+      ctx.closePath(); ctx.fill();
     }}
   }}
   updateRuler();
 }}
 
-// ── Init ─────────────────────────────────────────────────────────────────
+// ── Init ──────────────────────────────────────────────────────────────────
 function init(){{
-  if (!wrap.offsetWidth) {{ requestAnimationFrame(init); return; }}
+  if(!wrap.offsetWidth){{ requestAnimationFrame(init); return; }}
   resizeCanvas();
-  buildCellSelector();
+  buildCellTree();
   loadCell(INIT_CELL);
 }}
 requestAnimationFrame(init);
 
-// ── Toolbar mode ──────────────────────────────────────────────────────────
-let mode = 'pan';
+// ── Toolbar ───────────────────────────────────────────────────────────────
+let mode='pan';
 function setMode(m){{
-  mode = m;
-  ['bPan','bBox'].forEach(id => document.getElementById(id).classList.remove('on'));
-  document.getElementById(m === 'pan' ? 'bPan' : 'bBox').classList.add('on');
+  mode=m;
+  ['bPan','bBox'].forEach(id=>document.getElementById(id).classList.remove('on'));
+  document.getElementById(m==='pan'?'bPan':'bBox').classList.add('on');
 }}
-document.getElementById('bPan').addEventListener('click',  () => setMode('pan'));
-document.getElementById('bBox').addEventListener('click',  () => setMode('zoombox'));
-document.getElementById('bReset').addEventListener('click', () => {{ sc=iSc;tx=iTx;ty=iTy;render(); }});
+document.getElementById('bPan').onclick  = ()=>setMode('pan');
+document.getElementById('bBox').onclick  = ()=>setMode('zoombox');
+document.getElementById('bReset').onclick= ()=>{{sc=iSc;tx=iTx;ty=iTy;updateZoom();render();}};
+document.getElementById('bGrid').onclick = ()=>{{
+  showGrid=!showGrid;
+  document.getElementById('bGrid').classList.toggle('on',showGrid);
+  render();
+}};
 
 // ── Scroll-wheel zoom ─────────────────────────────────────────────────────
-wrap.addEventListener('wheel', e => {{
+wrap.addEventListener('wheel',e=>{{
   e.preventDefault();
-  const r  = wrap.getBoundingClientRect();
-  const mx = e.clientX - r.left, my = e.clientY - r.top;
-  const d  = e.deltaY < 0 ? 1.15 : 1 / 1.15;
-  tx = (tx - mx) * d + mx;
-  ty = (ty - my) * d + my;
-  sc *= d;
-  render();
-}}, {{passive: false}});
+  const r=wrap.getBoundingClientRect();
+  const mx=e.clientX-r.left, my=e.clientY-r.top;
+  const d=e.deltaY<0?1.15:1/1.15;
+  tx=(tx-mx)*d+mx; ty=(ty-my)*d+my; sc*=d;
+  updateZoom(); render();
+}},{{passive:false}});
 
 // ── Mouse drag (pan / box-zoom) ───────────────────────────────────────────
-let drag = false, dsx, dsy, dtx, dty, bx0, by0;
-
-wrap.addEventListener('mousedown', e => {{
-  if (e.button !== 0 && e.button !== 1) return;
-  e.preventDefault();
-  drag = true;
-  dsx = e.clientX; dsy = e.clientY; dtx = tx; dty = ty;
-  const r = wrap.getBoundingClientRect();
-  bx0 = e.clientX - r.left; by0 = e.clientY - r.top;
-  if (mode === 'zoombox')
-    sel.style.cssText = `left:${{bx0}}px;top:${{by0}}px;width:0;height:0;display:block`;
+let drag=false, dsx,dsy,dtx,dty,bx0,by0;
+wrap.addEventListener('mousedown',e=>{{
+  if(e.button!==0&&e.button!==1) return;
+  e.preventDefault(); drag=true;
+  dsx=e.clientX; dsy=e.clientY; dtx=tx; dty=ty;
+  const r=wrap.getBoundingClientRect();
+  bx0=e.clientX-r.left; by0=e.clientY-r.top;
+  if(mode==='zoombox')
+    sel.style.cssText=`left:${{bx0}}px;top:${{by0}}px;width:0;height:0;display:block`;
 }});
-
-window.addEventListener('mousemove', e => {{
-  if (!drag) return;
-  if (mode === 'pan') {{
-    tx = dtx + (e.clientX - dsx);
-    ty = dty + (e.clientY - dsy);
-    render();
-  }} else {{
-    const r  = wrap.getBoundingClientRect();
-    const cx = Math.max(0, Math.min(r.width,  e.clientX - r.left));
-    const cy = Math.max(0, Math.min(r.height, e.clientY - r.top));
-    sel.style.left   = Math.min(bx0, cx) + 'px';
-    sel.style.top    = Math.min(by0, cy) + 'px';
-    sel.style.width  = Math.abs(cx - bx0) + 'px';
-    sel.style.height = Math.abs(cy - by0) + 'px';
+window.addEventListener('mousemove',e=>{{
+  if(!drag) return;
+  if(mode==='pan'){{
+    tx=dtx+(e.clientX-dsx); ty=dty+(e.clientY-dsy); render();
+  }}else{{
+    const r=wrap.getBoundingClientRect();
+    const cx=Math.max(0,Math.min(r.width, e.clientX-r.left));
+    const cy=Math.max(0,Math.min(r.height,e.clientY-r.top));
+    sel.style.left  =Math.min(bx0,cx)+'px'; sel.style.top   =Math.min(by0,cy)+'px';
+    sel.style.width =Math.abs(cx-bx0)+'px'; sel.style.height=Math.abs(cy-by0)+'px';
+  }}
+}});
+window.addEventListener('mouseup',e=>{{
+  if(!drag) return; drag=false;
+  if(mode==='zoombox'){{
+    sel.style.display='none';
+    const r=wrap.getBoundingClientRect();
+    const cx=Math.max(0,Math.min(r.width, e.clientX-r.left));
+    const cy=Math.max(0,Math.min(r.height,e.clientY-r.top));
+    let nx0=Math.min(bx0,cx), ny0=Math.min(by0,cy);
+    let nw=Math.abs(cx-bx0), nh=Math.abs(cy-by0);
+    if(nw<6||nh<6) return;
+    const cAR=cv.width/cv.height, sAR=nw/nh;
+    if(sAR>cAR){{const n=nw/cAR;ny0-=(n-nh)/2;nh=n;}}
+    else       {{const n=nh*cAR;nx0-=(n-nw)/2;nw=n;}}
+    const wx0=(nx0-tx)/sc, wy0=(ny0-ty)/sc;
+    sc=sc*cv.width/nw; tx=-wx0*sc; ty=-wy0*sc;
+    updateZoom(); render();
   }}
 }});
 
-window.addEventListener('mouseup', e => {{
-  if (!drag) return;
-  drag = false;
-  if (mode === 'zoombox') {{
-    sel.style.display = 'none';
-    const r   = wrap.getBoundingClientRect();
-    const cx  = Math.max(0, Math.min(r.width,  e.clientX - r.left));
-    const cy  = Math.max(0, Math.min(r.height, e.clientY - r.top));
-    let nx0   = Math.min(bx0, cx), ny0 = Math.min(by0, cy);
-    let nw    = Math.abs(cx - bx0), nh  = Math.abs(cy - by0);
-    if (nw < 6 || nh < 6) return;
-    const cAR = cv.width / cv.height, sAR = nw / nh;
-    if (sAR > cAR) {{ const n = nw / cAR; ny0 -= (n - nh) / 2; nh = n; }}
-    else           {{ const n = nh * cAR; nx0 -= (n - nw) / 2; nw = n; }}
-    const wx0 = (nx0 - tx) / sc, wy0 = (ny0 - ty) / sc;
-    sc = sc * cv.width / nw;
-    tx = -wx0 * sc;
-    ty = -wy0 * sc;
-    render();
-  }}
+// ── Cursor coordinates ────────────────────────────────────────────────────
+wrap.addEventListener('mousemove',e=>{{
+  const r=wrap.getBoundingClientRect();
+  const wx= ((e.clientX-r.left)-tx)/sc;
+  const wy=-((e.clientY-r.top) -ty)/sc;  // negate: canvas y is flipped
+  const fmt=v=>(Math.abs(v)<1e4?+v.toPrecision(5):Math.round(v));
+  document.getElementById('coords').textContent=
+    'x: '+fmt(wx)+' '+UNIT+',  y: '+fmt(wy)+' '+UNIT;
+}});
+wrap.addEventListener('mouseleave',()=>{{
+  document.getElementById('coords').textContent='x: —, y: —';
 }});
 
-wrap.addEventListener('dblclick', () => {{ sc=iSc; tx=iTx; ty=iTy; render(); }});
+// ── Double-click → reset ──────────────────────────────────────────────────
+wrap.addEventListener('dblclick',()=>{{sc=iSc;tx=iTx;ty=iTy;updateZoom();render();}});
 </script></body></html>"""
 
-                components.html(html, height=660)
-                st.caption("Scroll to zoom · Drag to pan/box-zoom · Double-click to reset")
+                components.html(html, height=700)
+                st.caption(
+                    "Scroll to zoom · Drag to pan/box-zoom · Double-click to fit · "
+                    "Grid button toggles overlay · Click any cell in the tree to switch view")
 
         except Exception as e:
             st.error(f"Viewer Error: {e}")
