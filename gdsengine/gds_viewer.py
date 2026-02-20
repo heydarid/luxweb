@@ -848,19 +848,22 @@ wrap.addEventListener('wheel',e=>{{
 }},{{passive:false}});
 
 // ── Mouse drag ────────────────────────────────────────────────────────────
-let drag=false, dsx,dsy,dtx,dty,bx0,by0;
+// Middle button (1) always pans regardless of mode.
+// In zoombox mode, dragging top-left→bottom-right zooms IN to the rect;
+// dragging bottom-right→top-left (reverse) zooms OUT to fit the layout.
+let drag=false, dragBtn=-1, dsx,dsy,dtx,dty,bx0,by0;
 wrap.addEventListener('mousedown',e=>{{
   if(e.button!==0&&e.button!==1) return;
-  e.preventDefault(); drag=true;
+  e.preventDefault(); drag=true; dragBtn=e.button;
   dsx=e.clientX; dsy=e.clientY; dtx=tx; dty=ty;
   const r=wrap.getBoundingClientRect();
   bx0=e.clientX-r.left; by0=e.clientY-r.top;
-  if(mode==='zoombox')
+  if(mode==='zoombox'&&dragBtn===0)
     sel.style.cssText=`left:${{bx0}}px;top:${{by0}}px;width:0;height:0;display:block`;
 }});
 window.addEventListener('mousemove',e=>{{
   if(!drag) return;
-  if(mode==='pan'){{
+  if(mode==='pan'||dragBtn===1){{
     tx=dtx+(e.clientX-dsx); ty=dty+(e.clientY-dsy); render();
   }}else{{
     const r=wrap.getBoundingClientRect();
@@ -872,14 +875,23 @@ window.addEventListener('mousemove',e=>{{
 }});
 window.addEventListener('mouseup',e=>{{
   if(!drag) return; drag=false;
-  if(mode==='zoombox'){{
+  if(mode==='zoombox'&&dragBtn===0){{
     sel.style.display='none';
     const r=wrap.getBoundingClientRect();
     const cx=Math.max(0,Math.min(r.width, e.clientX-r.left));
     const cy=Math.max(0,Math.min(r.height,e.clientY-r.top));
-    let nx0=Math.min(bx0,cx), ny0=Math.min(by0,cy);
     let nw=Math.abs(cx-bx0), nh=Math.abs(cy-by0);
-    if(nw<6||nh<6) return;
+    if(nw<6||nh<6){{ dragBtn=-1; return; }}
+
+    // Detect drag direction: end is up-left of start → zoom out (fit)
+    const endRight = (e.clientX-r.left) >= bx0;
+    const endBelow = (e.clientY-r.top)  >= by0;
+    if(!endRight && !endBelow){{
+      sc=iSc; tx=iTx; ty=iTy; updateZoom(); render();
+      dragBtn=-1; return;
+    }}
+
+    let nx0=Math.min(bx0,cx), ny0=Math.min(by0,cy);
     const cAR=cv.width/cv.height, sAR=nw/nh;
     if(sAR>cAR){{const n=nw/cAR;ny0-=(n-nh)/2;nh=n;}}
     else       {{const n=nh*cAR;nx0-=(n-nw)/2;nw=n;}}
@@ -887,6 +899,7 @@ window.addEventListener('mouseup',e=>{{
     sc=sc*cv.width/nw; tx=-wx0*sc; ty=-wy0*sc;
     updateZoom(); render();
   }}
+  dragBtn=-1;
 }});
 
 wrap.addEventListener('mousemove',e=>{{
@@ -902,12 +915,14 @@ wrap.addEventListener('mouseleave',()=>{{
 }});
 
 wrap.addEventListener('dblclick',()=>{{sc=iSc;tx=iTx;ty=iTy;updateZoom();render();}});
+wrap.addEventListener('auxclick',e=>e.preventDefault());   // suppress middle-click auto-scroll
 </script></body></html>"""
 
                 components.html(html, height=700)
                 st.caption(
-                    "Scroll to zoom \u00b7 Drag to pan/box-zoom \u00b7 "
-                    "Double-click to fit \u00b7 Grid toggles overlay")
+                    "Scroll to zoom \u00b7 Middle-click drag to pan \u00b7 "
+                    "Box zoom: drag \u2198 to zoom in, drag \u2196 to zoom out \u00b7 "
+                    "Double-click to fit")
 
         except Exception as e:
             st.error(f"Viewer Error: {e}")
