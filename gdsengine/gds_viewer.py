@@ -615,7 +615,7 @@ function buildLayerPanel(){{
     const toggle = () => {{
       if(cb.checked) hiddenNums.delete(lnum); else hiddenNums.add(lnum);
       row.className = 'lr' + (hiddenNums.has(lnum) ? ' hidden' : '');
-      render();
+      scheduleRender();
     }};
     cb.addEventListener('change', toggle);
     row.addEventListener('click', e => {{ if(e.target!==cb && e.target!==lbl){{ cb.checked=!cb.checked; toggle(); }} }});
@@ -626,13 +626,13 @@ document.getElementById('bShowAll').onclick = () => {{
   hiddenNums.clear();
   document.querySelectorAll('#layerScroll .lr').forEach(r => {{
     r.className='lr'; r.querySelector('input').checked=true; }});
-  render();
+  scheduleRender();
 }};
 document.getElementById('bHideAll').onclick = () => {{
   LAYERS.forEach(([lnum]) => hiddenNums.add(lnum));
   document.querySelectorAll('#layerScroll .lr').forEach(r => {{
     r.className='lr hidden'; r.querySelector('input').checked=false; }});
-  render();
+  scheduleRender();
 }};
 
 // ── Cell hierarchy tree ───────────────────────────────────────────────────
@@ -761,14 +761,19 @@ function updateRuler(){{
 }}
 
 // ══════════════════════════════════════════════════════════════════════════
-// RENDER — KLayout-style:
-//   1. Black background
-//   2. For each visible layer, for each polygon:
-//      a. Fill with stipple pattern (opaque at '*' pixels, transparent at '.')
-//      b. Stroke outline in frame_color (1px)
-//   3. Because stipple has transparent gaps, you see through to layers below
-//      and the black background — same visual as KLayout/kwasm.
+// RENDER — KLayout-style + performance optimizations:
+//   - LOD: skip polygons smaller than 2px (sub-pixel at zoom-out)
+//   - Throttled to one render per animation frame
 // ══════════════════════════════════════════════════════════════════════════
+let renderScheduled = false;
+function scheduleRender(){{
+  if(renderScheduled) return;
+  renderScheduled = true;
+  requestAnimationFrame(()=>{{
+    renderScheduled = false;
+    render();
+  }});
+}}
 function render(){{
   const W=cv.width, H=cv.height;
   ctx.fillStyle='#000';
@@ -777,6 +782,7 @@ function render(){{
 
   const wxMin=-tx/sc, wyMin=-ty/sc;
   const wxMax=(W-tx)/sc, wyMax=(H-ty)/sc;
+  const MIN_PX = 2;  // LOD: skip polys smaller than this in screen space
 
   for(let li=0; li<LAYERS.length; li++){{
     const [lnum,,,,, polys, bounds] = LAYERS[li];
@@ -784,13 +790,15 @@ function render(){{
 
     const pat   = fillPatterns[li];
     const frc   = frameColors[li];
-
-    // Anchor stipple to screen origin (fixed pixel grid)
     pat.setTransform(new DOMMatrix([1,0,0,1, tx%1, ty%1]));
 
     for(let pi=0; pi<polys.length; pi++){{
       const [bx0,by0,bx1,by1] = bounds[pi];
       if(bx1<wxMin||bx0>wxMax||by1<wyMin||by0>wyMax) continue;
+
+      // LOD: skip sub-pixel polygons (huge win when zoomed out)
+      const sw=(bx1-bx0)*sc, sh=(by1-by0)*sc;
+      if(sw<MIN_PX&&sh<MIN_PX) continue;
 
       const poly = polys[pi];
       ctx.beginPath();
@@ -799,11 +807,8 @@ function render(){{
         ctx.lineTo(poly[k]*sc+tx, poly[k+1]*sc+ty);
       ctx.closePath();
 
-      // Stipple fill
       ctx.fillStyle = pat;
       ctx.fill();
-
-      // Frame outline (1px, KLayout style)
       ctx.strokeStyle = frc;
       ctx.lineWidth = 1;
       ctx.stroke();
@@ -830,11 +835,11 @@ function setMode(m){{
 }}
 document.getElementById('bPan').onclick   = ()=>setMode('pan');
 document.getElementById('bBox').onclick   = ()=>setMode('zoombox');
-document.getElementById('bReset').onclick = ()=>{{sc=iSc;tx=iTx;ty=iTy;updateZoom();render();}};
+document.getElementById('bReset').onclick = ()=>{{sc=iSc;tx=iTx;ty=iTy;updateZoom();scheduleRender();}};
 document.getElementById('bGrid').onclick  = ()=>{{
   showGrid=!showGrid;
   document.getElementById('bGrid').classList.toggle('on',showGrid);
-  render();
+  scheduleRender();
 }};
 
 // ── Scroll-wheel zoom ─────────────────────────────────────────────────────
@@ -844,7 +849,7 @@ wrap.addEventListener('wheel',e=>{{
   const mx=e.clientX-r.left, my=e.clientY-r.top;
   const d=e.deltaY<0?1.15:1/1.15;
   tx=(tx-mx)*d+mx; ty=(ty-my)*d+my; sc*=d;
-  updateZoom(); render();
+  updateZoom(); scheduleRender();
 }},{{passive:false}});
 
 // ── Mouse drag ────────────────────────────────────────────────────────────
@@ -864,7 +869,7 @@ wrap.addEventListener('mousedown',e=>{{
 window.addEventListener('mousemove',e=>{{
   if(!drag) return;
   if(mode==='pan'||dragBtn===1){{
-    tx=dtx+(e.clientX-dsx); ty=dty+(e.clientY-dsy); render();
+    tx=dtx+(e.clientX-dsx); ty=dty+(e.clientY-dsy); scheduleRender();
   }}else{{
     const r=wrap.getBoundingClientRect();
     const cx=Math.max(0,Math.min(r.width, e.clientX-r.left));
@@ -887,7 +892,7 @@ window.addEventListener('mouseup',e=>{{
     const endRight = (e.clientX-r.left) >= bx0;
     const endBelow = (e.clientY-r.top)  >= by0;
     if(!endRight && !endBelow){{
-      sc=iSc; tx=iTx; ty=iTy; updateZoom(); render();
+      sc=iSc; tx=iTx; ty=iTy; updateZoom(); scheduleRender();
       dragBtn=-1; return;
     }}
 
@@ -897,7 +902,7 @@ window.addEventListener('mouseup',e=>{{
     else       {{const n=nh*cAR;nx0-=(n-nw)/2;nw=n;}}
     const wx0=(nx0-tx)/sc, wy0=(ny0-ty)/sc;
     sc=sc*cv.width/nw; tx=-wx0*sc; ty=-wy0*sc;
-    updateZoom(); render();
+    updateZoom(); scheduleRender();
   }}
   dragBtn=-1;
 }});
@@ -914,7 +919,7 @@ wrap.addEventListener('mouseleave',()=>{{
   document.getElementById('coords').textContent='x: \\u2014, y: \\u2014';
 }});
 
-wrap.addEventListener('dblclick',()=>{{sc=iSc;tx=iTx;ty=iTy;updateZoom();render();}});
+wrap.addEventListener('dblclick',()=>{{sc=iSc;tx=iTx;ty=iTy;updateZoom();scheduleRender();}});
 wrap.addEventListener('auxclick',e=>e.preventDefault());   // suppress middle-click auto-scroll
 </script></body></html>"""
 
